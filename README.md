@@ -1,124 +1,124 @@
 # LinkSnapper
 
-LinkSnapper 是一个强大的网页截图工具，支持多种类型网站的智能截图，包括动态加载、单页应用和静态网站。
+LinkSnapper is a powerful web screenshot tool that supports intelligent screenshot capture for various types of websites, including dynamic loading, single-page applications, and static websites.
 
-## 功能特点
+## Features
 
-- 🌐 支持多种类型网站
-  - 动态加载网站（如 B站、知乎等）
-  - 单页应用（SPA）
-  - 静态网站
-- 📸 智能截图
-  - 自动检测网站类型
-  - 智能等待页面加载
-  - 支持分页截图
-- 🌙 深色模式支持
-- 🔄 自动重试机制
-- 📱 响应式设计
+- 🌐 Multi-website Support
+  - Dynamic loading websites (e.g., Bilibili, Zhihu)
+  - Single-page applications (SPA)
+  - Static websites
+- 📸 Smart Screenshot
+  - Automatic website type detection
+  - Intelligent page load waiting
+  - Pagination screenshot support
+- 🌙 Dark Mode Support
+- 🔄 Automatic Retry Mechanism
+- 📱 Responsive Design
 
-## 技术架构
+## Tech Stack
 
-- 前端：Next.js + TypeScript + Tailwind CSS
-- 截图引擎：Puppeteer
-- 容器化：Docker
+- Frontend: Next.js + TypeScript + Tailwind CSS
+- Screenshot Engine: Puppeteer
+- Containerization: Docker
 
-## 本地开发
+## Local Development
 
-1. 克隆项目
+1. Clone the project
 ```bash
 git clone git@github.com:shenkaidong/LinkSnapper.git
 cd LinkSnapper
 ```
 
-2. 安装依赖
+2. Install dependencies
 ```bash
 npm install
-# 或
+# or
 yarn install
 ```
 
-3. 启动开发服务器
+3. Start development server
 ```bash
 npm run dev
-# 或
+# or
 yarn dev
 ```
 
-4. 访问 http://localhost:3000
+4. Visit http://localhost:3000
 
-## 部署指南
+## Deployment Guide
 
-### 1. 传统服务器部署
+### 1. Traditional Server Deployment
 
-1. 准备环境
+1. Prepare environment
 ```bash
-# 安装 Node.js (推荐 v18+)
+# Install Node.js (v18+ recommended)
 curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
 sudo apt-get install -y nodejs
 
-# 安装 PM2
+# Install PM2
 npm install -g pm2
 ```
 
-2. 构建项目
+2. Build project
 ```bash
 npm run build
-# 或
+# or
 yarn build
 ```
 
-3. 使用 PM2 启动
+3. Start with PM2
 ```bash
 pm2 start npm --name "linksnapper" -- start
 ```
 
-### 2. Docker 部署
+### 2. Docker Deployment
 
-1. 构建镜像
+1. Build image
 ```bash
 docker build -t linksnapper .
 ```
 
-2. 运行容器
+2. Run container
 ```bash
 docker run -d -p 3000:3000 --name linksnapper linksnapper
 ```
 
-Dockerfile 示例：
+Dockerfile example:
 ```dockerfile
-# 基础镜像
+# Base image
 FROM node:18-alpine
 
-# 安装 Chromium
+# Install Chromium
 RUN apk add --no-cache chromium
 
-# 设置工作目录
+# Set working directory
 WORKDIR /app
 
-# 复制项目文件
+# Copy project files
 COPY . .
 
-# 安装依赖
+# Install dependencies
 RUN npm install
 
-# 构建项目
+# Build project
 RUN npm run build
 
-# 暴露端口
+# Expose port
 EXPOSE 3000
 
-# 启动服务
+# Start service
 CMD ["npm", "start"]
 ```
 
-### 3. Vercel 部署
+### 3. Vercel Deployment
 
-1. 安装 Vercel CLI
+1. Install Vercel CLI
 ```bash
 npm i -g vercel
 ```
 
-2. 登录并部署
+2. Login and deploy
 ```bash
 vercel login
 vercel
@@ -126,7 +126,7 @@ vercel
 
 ### 4. GitHub Actions CI/CD
 
-在 `.github/workflows/main.yml` 创建工作流：
+Create workflow in `.github/workflows/main.yml`:
 
 ```yaml
 name: CI/CD
@@ -161,66 +161,68 @@ jobs:
     - name: Deploy to production
       if: github.ref == 'refs/heads/main'
       run: |
-        # 这里添加你的部署命令
-        # 例如部署到 Vercel:
+        # Add your deployment commands here
+        # For example, deploy to Vercel:
         npx vercel --token ${VERCEL_TOKEN} --prod
       env:
         VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
 ```
 
-## 环境变量配置
+## Environment Variables
 
-创建 `.env` 文件：
+Create `.env` file:
 
 ```env
-# 基础配置
+# Base configuration
 NEXT_PUBLIC_API_URL=http://localhost:3000
 NODE_ENV=development
 
-# Chrome 配置
+# Chrome configuration
 CHROME_PATH=/usr/bin/google-chrome
 ```
 
-## 项目结构
+## Project Structure
 
 ```
 LinkSnapper/
 ├── src/
-│   ├── app/                 # Next.js 应用目录
-│   │   ├── api/            # API 路由
-│   │   │   └── screenshot/ # 截图相关 API
-│   │   ├── page.tsx        # 主页面
-│   │   └── globals.css     # 全局样式
-│   ├── services/           # 服务层
-│   │   └── screenshot/     # 截图服务
-│   └── utils/              # 工具函数
-├── public/                 # 静态资源
-├── Dockerfile             # Docker 配置
-└── package.json          # 项目配置
+│   ├── app/                 # Next.js application directory
+│   │   ├── api/            # API routes
+│   │   │   └── screenshot/ # Screenshot related API
+│   │   ├── page.tsx        # Main page
+│   │   └── globals.css     # Global styles
+│   ├── services/           # Service layer
+│   │   └── screenshot/     # Screenshot service
+│   └── utils/              # Utility functions
+├── public/                 # Static assets
+├── Dockerfile             # Docker configuration
+└── package.json          # Project configuration
 ```
 
-## 注意事项
+## Notes
 
-1. 确保服务器有足够的内存（建议至少 2GB）
-2. 需要安装 Chrome/Chromium
-3. 某些网站可能有反爬虫机制，需要适当配置请求头和 Cookie
+1. Ensure server has sufficient memory (2GB minimum recommended)
+2. Chrome/Chromium installation required
+3. Some websites may have anti-crawler mechanisms, requiring proper header and cookie configuration
 
-## 贡献指南
+## Contributing
 
-1. Fork 项目
-2. 创建特性分支 (`git checkout -b feature/AmazingFeature`)
-3. 提交改动 (`git commit -m 'Add some AmazingFeature'`)
-4. 推送到分支 (`git push origin feature/AmazingFeature`)
-5. 提交 Pull Request
+1. Fork the project
+2. Create feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to branch (`git push origin feature/AmazingFeature`)
+5. Submit Pull Request
 
-## 许可证
+## License
 
-MIT License - 详见 [LICENSE](LICENSE) 文件
+MIT License - See [LICENSE](LICENSE) file for details
 
-## 作者
+## Author
 
 Kaidong Shen - [@shenkaidong](https://github.com/shenkaidong)
 
-## 支持
+## Support
 
-如果你觉得这个项目有帮助，请给它一个星标 ⭐️ 
+If you find this project helpful, please give it a star ⭐️
+
+[中文文档](README-CN.md) 
