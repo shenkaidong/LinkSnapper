@@ -1,0 +1,107 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 255 255 255;
+    --foreground: 0 0 0;
+    --card: 255 255 255;
+    --card-foreground: 0 0 0;
+    --primary: 99 102 241;
+    --primary-foreground: 255 255 255;
+    --gradient-start: 108 99 255;
+    --gradient-end: 147 51 255;
+  }
+
+  [data-theme='dark'] {
+    --background: 17 24 39;
+    --foreground: 255 255 255;
+    --card: 31 41 55;
+    --card-foreground: 255 255 255;
+    --primary: 108 99 255;
+    --primary-foreground: 255 255 255;
+    --gradient-start: 108 99 255;
+    --gradient-end: 147 51 255;
+  }
+}
+
+@layer components {
+  .bg-gradient-custom {
+    @apply bg-background text-foreground;
+  }
+
+  .card {
+    @apply bg-card text-card-foreground;
+  }
+
+  .btn-primary {
+    @apply bg-primary text-primary-foreground;
+  }
+
+  .text-gradient {
+    @apply bg-clip-text text-transparent bg-gradient-to-r from-[rgb(var(--gradient-start))] to-[rgb(var(--gradient-end))] animate-gradient-shine;
+  }
+
+  .btn-gradient {
+    @apply relative overflow-hidden;
+  }
+
+  .btn-gradient::before {
+    @apply content-[''] absolute inset-0 bg-gradient-to-r from-[rgb(var(--gradient-start))] to-[rgb(var(--gradient-end))] opacity-100 transition-opacity duration-300;
+  }
+
+  .btn-gradient:hover::before {
+    @apply opacity-80;
+  }
+}
+
+/* 自定义滚动条 */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  @apply bg-background;
+}
+
+::-webkit-scrollbar-thumb {
+  @apply bg-primary/20 rounded-full;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  @apply bg-primary/30;
+}
+
+/* 动画 */
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes gradient-shine {
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+.animate-slideIn {
+  animation: slideIn 0.5s ease-out forwards;
+}
+
+/* 全局过渡效果 */
+* {
+  @apply transition-colors duration-300;
+} 
