@@ -52,28 +52,9 @@ async function waitForDynamicContent(page: Page): Promise<boolean> {
 
 async function scrollAndWaitForContent(page: Page, targetPosition: number): Promise<boolean> {
   return page.evaluate(async (target: number) => {
-    // 定义平滑滚动函数
-    const smoothScroll = async () => {
-      const startPosition = window.pageYOffset
-      const distance = target - startPosition
-      const duration = 1000
-      const steps = 20
-      const stepTime = duration / steps
-
-      for (let i = 0; i <= steps; i++) {
-        const progress = i / steps
-        const currentPosition = startPosition + (distance * progress)
-        window.scrollTo(0, currentPosition)
-        
-        // 触发滚动事件
-        window.dispatchEvent(new Event('scroll'))
-        
-        await new Promise(resolve => setTimeout(resolve, stepTime))
-      }
-    }
-
-    // 执行滚动
-    await smoothScroll()
+    // 首先直接滚动到目标位置
+    window.scrollTo(0, target)
+    await new Promise(resolve => setTimeout(resolve, 500))
 
     // 检查是否到达目标位置
     const finalPosition = window.pageYOffset
@@ -165,7 +146,7 @@ async function waitForPageLoad(page: Page, websiteType: 'dynamic' | 'static' | '
   }
 }
 
-async function takeScreenshot(url: string, fullPage: boolean, retryCount = 0): Promise<{ screenshot: string; isEnd: boolean }> {
+async function takeScreenshot(url: string, fullPage: boolean, retryCount = 0, singleShot = false): Promise<{ screenshot: string; isEnd: boolean }> {
   let browser: Browser | null = null
   
   try {
@@ -245,6 +226,63 @@ async function takeScreenshot(url: string, fullPage: boolean, retryCount = 0): P
     // 等待页面加载完成
     await waitForPageLoad(page, websiteType)
 
+    if (fullPage) {
+      // 全页面截图逻辑
+      if (websiteType === 'dynamic' || websiteType === 'spa') {
+        // 动态网站需要预加载内容
+        await page.evaluate(async () => {
+          const scrollStep = 200
+          let lastScroll = 0
+          
+          while (true) {
+            window.scrollBy(0, scrollStep)
+            await new Promise(resolve => setTimeout(resolve, 100))
+            
+            const currentScroll = window.pageYOffset
+            if (currentScroll === lastScroll) {
+              break
+            }
+            lastScroll = currentScroll
+          }
+          
+          window.scrollTo(0, 0)
+        })
+        
+        // 等待动态内容加载
+        await waitForDynamicContent(page)
+      }
+
+      // 截取整个页面
+      const screenshot = await page.screenshot({
+        fullPage: true,
+        type: 'png',
+        optimizeForSpeed: true,
+        encoding: 'base64'
+      })
+
+      await browser.close()
+      return {
+        screenshot: screenshot as string,
+        isEnd: true
+      }
+    }
+
+    // 如果是普通截图（单次截图），直接截取当前视口
+    if (singleShot) {
+      const screenshot = await page.screenshot({
+        fullPage: false,
+        type: 'png',
+        optimizeForSpeed: true,
+        encoding: 'base64'
+      })
+
+      await browser.close()
+      return {
+        screenshot: screenshot as string,
+        isEnd: true
+      }
+    }
+
     // 获取上次滚动位置
     const lastPosition = globalScrollPositions[url] || 0
     console.log('Last scroll position:', lastPosition)
@@ -286,10 +324,24 @@ async function takeScreenshot(url: string, fullPage: boolean, retryCount = 0): P
 
     // 根据网站类型执行滚动
     if (websiteType === 'dynamic' || websiteType === 'spa') {
-      await scrollAndWaitForContent(page, lastPosition)
+      // 先滚动到上次的位置
+      await page.evaluate((pos) => window.scrollTo(0, pos), lastPosition)
       await waitForDynamicContent(page)
-      const canContinueScroll = await scrollAndWaitForContent(page, newPosition)
+      
+      // 滚动到新位置
+      await page.evaluate((pos) => window.scrollTo(0, pos), newPosition)
       await waitForDynamicContent(page)
+      
+      // 检查是否可以继续滚动
+      const canContinueScroll = await page.evaluate(() => {
+        const scrollPosition = window.pageYOffset + window.innerHeight
+        const totalHeight = Math.max(
+          document.documentElement.scrollHeight,
+          document.body.scrollHeight,
+          document.documentElement.offsetHeight
+        )
+        return scrollPosition < totalHeight - 100 // 留出一些余量
+      })
 
       if (!canContinueScroll) {
         console.log('Reached the bottom of dynamic/spa content')
@@ -380,10 +432,15 @@ async function takeScreenshot(url: string, fullPage: boolean, retryCount = 0): P
 }
 
 export async function POST(request: Request) {
-  const { url, fullPage = false } = await request.json()
+  const { url, fullPage = false, singleShot = false } = await request.json()
   
   try {
-    const result = await takeScreenshot(url, fullPage)
+    // 如果是普通截图（单次截图），清除之前的滚动位置
+    if (singleShot) {
+      delete globalScrollPositions[url]
+    }
+    
+    const result = await takeScreenshot(url, fullPage, 0, singleShot)
     return Response.json({ 
       success: true, 
       screenshot: result.screenshot,

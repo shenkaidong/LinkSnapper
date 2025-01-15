@@ -18,7 +18,10 @@ export default function SnapshotPage() {
         headers: {
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ 
+          url,
+          singleShot: true // 普通截图模式
+        }),
       });
       
       const data = await response.json();
