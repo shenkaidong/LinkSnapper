@@ -74,12 +74,25 @@ jobs:
           path: /tmp/linksnapper-smoke-server.log
           if-no-files-found: ignore
 
-  # Docker 镜像构建校验。没有这一环的话，Dockerfile 往往要等到真正部署时才暴露问题。
+  # Docker 镜像校验。
+  #
+  # 这个 job 的价值不只是「能不能构建」：镜像是本地唯一无法验证的部分，
+  # 而 alpine 自带的 Chromium 版本会随基础镜像漂移，一旦与 puppeteer-core 错位
+  # 就会出现「服务能起、但截图超时」这类不易察觉的故障。
+  # 所以这里真的起容器并跑一遍完整截图冒烟，而不是只探一下健康接口。
   docker:
     runs-on: ubuntu-latest
     needs: verify
     steps:
       - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: 安装依赖（宿主机侧跑冒烟用）
+        run: npm ci
 
       - uses: docker/setup-buildx-action@v3
 
@@ -93,17 +106,34 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: 启动容器并检查健康接口
+      - name: 启动容器
         run: |
-          docker run -d --name linksnapper-ci -p 3000:3000 --shm-size=1g linksnapper:ci
+          # 容器内的浏览器要访问容器自身的 127.0.0.1，因此需要精确放行该主机；
+          # ENABLE_TEST_ENDPOINTS 用于重定向型 SSRF 用例。
+          docker run -d --name linksnapper-ci \
+            -p 3000:3000 --shm-size=1g \
+            -e ALLOWED_INTERNAL_HOSTS=127.0.0.1 \
+            -e ENABLE_TEST_ENDPOINTS=1 \
+            -e RATE_LIMIT_CAPACITY=100 \
+            linksnapper:ci
+
           for i in $(seq 1 40); do
             if curl -sf http://127.0.0.1:3000/api/health >/dev/null; then
-              echo "容器内服务已就绪"
+              echo "容器内服务已就绪："
               curl -s http://127.0.0.1:3000/api/health
+              echo
               exit 0
             fi
             sleep 2
           done
+
           echo "容器内服务未就绪，输出日志："
           docker logs linksnapper-ci
           exit 1
+
+      - name: 在容器上跑端到端截图冒烟
+        run: BASE_URL=http://127.0.0.1:3000 node scripts/smoke-test.mjs
+
+      - name: 失败时输出容器日志
+        if: failure()
+        run: docker logs linksnapper-ci || true

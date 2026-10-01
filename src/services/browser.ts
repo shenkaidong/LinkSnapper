@@ -53,12 +53,27 @@ function launchArgs(): string[] {
   ]
 }
 
+/**
+ * 无头模式的取值。
+ *
+ * `headless: 'new'` 是 puppeteer 21 的写法，在 22+ 里已被移除（改回 `headless: true`）。
+ * 做成环境变量是为了让「升级 puppeteer-core / 更换基础镜像」这类操作不必改代码 —— 
+ * 这两个动作往往必须同时做，硬编码会让升级路径变脆。
+ */
+function resolveHeadlessMode(): 'new' | boolean {
+  const raw = (process.env.HEADLESS_MODE || '').trim().toLowerCase()
+  if (!raw) return 'new'
+  if (raw === 'true') return true
+  if (raw === 'false') return false
+  return 'new'
+}
+
 async function launchBrowser(): Promise<Browser> {
   const executablePath = await getChromePath()
 
   const browser = await puppeteer.launch({
     executablePath,
-    headless: 'new',
+    headless: resolveHeadlessMode(),
     args: launchArgs(),
     defaultViewport: {
       width: 1920,

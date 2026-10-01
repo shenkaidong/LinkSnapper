@@ -70,6 +70,8 @@ npm run build         # production build
 bash scripts/run-smoke.sh          # starts the server, runs everything, tears down
 BUILD=1 bash scripts/run-smoke.sh  # rebuild first
 SMOKE_EXTERNAL=1 bash scripts/run-smoke.sh   # also exercise real external sites
+
+npm run bench         # paged-capture performance comparison (server must be running)
 ```
 
 The smoke suite does not depend on external sites. It uses a bundled fixture page
@@ -80,6 +82,20 @@ makes "no overlap, no gap" a real assertion rather than an arithmetic coincidenc
 The fixture is served from `127.0.0.1`, so the runner sets `ALLOWED_INTERNAL_HOSTS=127.0.0.1` to
 whitelist **exactly that one host**. Every other private address stays blocked, which is what keeps
 the security cases meaningful.
+
+## Performance
+
+Two ways of collecting the same three segments (Apple Silicon, bundled fixture page):
+
+| Approach | Time | Requests |
+|---|---|---|
+| One request per segment (`maxSegments=1`, i.e. the pre-refactor behaviour) | ~1838ms | 3 |
+| Three segments in one request (`maxSegments=3`) | ~692ms | 1 |
+
+**Roughly 2.7× faster.** `npm run bench` also verifies both approaches return identical segments,
+so the speed-up is not simply doing less work. The gain comes from two places: reusing the Chromium
+instance removes the cold start, and batching means the page loads once and the lazy-load
+pre-scroll runs once.
 
 ## Environment variables
 
@@ -161,6 +177,15 @@ docker run -d -p 3000:3000 --shm-size=1g linksnapper
 The image is alpine-based and ships Chromium, CJK fonts, and the system libraries sharp needs.
 tini runs as PID 1 to reap zombie Chromium processes. Keep `--shm-size=1g` — Chromium crashes
 easily with the default 64MB `/dev/shm`.
+
+> ⚠️ **Version coupling — read before bumping the base image**
+> This project drives the **system** Chromium with `puppeteer-core`, so the two versions need to
+> roughly match. Alpine's chromium package moves with the base image, and a mismatch shows up as
+> "the service starts but captures time out" rather than an obvious crash. The build logs the
+> actual Chromium version (`chromium-browser --version`), and the CI docker job starts the
+> container and runs the full capture smoke suite to catch exactly this.
+> If that job fails: either roll the base image back, or bump `puppeteer-core` too
+> (note that puppeteer 22+ removed `headless: 'new'` — set `HEADLESS_MODE=true` in that case).
 
 ## Security notes
 

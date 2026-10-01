@@ -10,6 +10,7 @@
     "typecheck": "tsc --noEmit",
     "test:unit": "node --experimental-transform-types --test tests/*.test.ts",
     "smoke": "node scripts/smoke-test.mjs",
+    "bench": "node scripts/bench.mjs",
     "test": "npm run typecheck && npm run test:unit"
   },
   "dependencies": {

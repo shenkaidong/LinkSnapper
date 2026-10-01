@@ -70,6 +70,8 @@ npm run build         # 生产构建
 bash scripts/run-smoke.sh          # 端到端冒烟：自动起服务、跑用例、收尾
 BUILD=1 bash scripts/run-smoke.sh  # 先重新构建再跑
 SMOKE_EXTERNAL=1 bash scripts/run-smoke.sh   # 额外跑一组真实外网站点用例
+
+npm run bench         # 分段截图性能对照（需服务已在跑）
 ```
 
 冒烟测试不依赖外部网站：它使用仓库自带的基准页 `/test-fixture.html`
@@ -78,6 +80,19 @@ SMOKE_EXTERNAL=1 bash scripts/run-smoke.sh   # 额外跑一组真实外网站点
 
 基准页跑在本机 `127.0.0.1` 上，所以 runner 会设置 `ALLOWED_INTERNAL_HOSTS=127.0.0.1`
 **只精确放行这一个主机**；其余内网地址仍然被拦，安全用例才有意义。
+
+## 性能
+
+分段截图的两种取法实测对比（本机 Apple Silicon，目标为自带基准页，取满 3 段）：
+
+| 取法 | 耗时 | 请求数 |
+|---|---|---|
+| 每段一次请求（`maxSegments=1`，即重构前的行为） | ~1838ms | 3 |
+| 一次请求取 3 段（`maxSegments=3`） | ~692ms | 1 |
+
+**约 2.7 倍提速**，且 `npm run bench` 会同时校验两种取法拿到的分段完全一致，
+确保「更快」不是因为少干活。收益主要来自两处：Chromium 实例复用省掉冷启动，
+批量分段让页面只加载一次、懒加载预滚动只跑一次。
 
 ## 环境变量
 
@@ -156,6 +171,14 @@ docker run -d -p 3000:3000 --shm-size=1g linksnapper
 镜像基于 alpine，已装好 Chromium、中文字体与 sharp 所需的系统库，
 并用 tini 作为 PID 1 以回收 Chromium 产生的僵尸进程。
 `--shm-size=1g` 建议保留 —— Chromium 在默认 64MB 的 `/dev/shm` 下容易崩溃。
+
+> ⚠️ **升级基础镜像前请注意版本耦合**
+> 本项目用 `puppeteer-core` 驱动镜像里**系统自带的** Chromium，两者版本需要大致对应。
+> Alpine 的 chromium 包会随基础镜像版本变化，错位时可能出现「服务能起但截图超时」
+> 这类不易察觉的故障。构建时会把实际的 Chromium 版本打进日志（`chromium-browser --version`）；
+> CI 的 docker job 会真的起容器跑一遍截图冒烟来卡住这一点。
+> 如果它失败：回退基础镜像版本，或同步升级 `puppeteer-core`
+>（后者注意 puppeteer 22+ 已移除 `headless: 'new'`，需同时设置 `HEADLESS_MODE=true`）。
 
 ## 安全说明
 
