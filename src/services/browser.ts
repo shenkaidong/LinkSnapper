@@ -12,7 +12,20 @@
  */
 
 import puppeteer, { Browser, Page } from 'puppeteer-core'
+import { createRequire } from 'node:module'
 import getChromePath from '@/utils/chrome'
+
+const require = createRequire(import.meta.url)
+
+/** 读入已安装的 puppeteer-core 主版本，用于决定 headless 的取值 */
+function puppeteerMajor(): number {
+  try {
+    const pkg = require('puppeteer-core/package.json')
+    return Number.parseInt(String(pkg.version).split('.')[0], 10) || 21
+  } catch {
+    return 21
+  }
+}
 
 const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS) || 30_000
 const IDLE_SHUTDOWN_MS = Number(process.env.BROWSER_IDLE_SHUTDOWN_MS) || 60_000
@@ -57,15 +70,17 @@ function launchArgs(): string[] {
  * 无头模式的取值。
  *
  * `headless: 'new'` 是 puppeteer 21 的写法，在 22+ 里已被移除（改回 `headless: true`）。
- * 做成环境变量是为了让「升级 puppeteer-core / 更换基础镜像」这类操作不必改代码 —— 
- * 这两个动作往往必须同时做，硬编码会让升级路径变脆。
+ * 做成环境变量 + 按已安装的 puppeteer-core 主版本自动兜底，是为了让
+ * 「升级 puppeteer-core」不必同时改代码：升级到 22+ 时 'new' 会自动降级成 true，
+ * 否则启动会直接报错。
  */
 function resolveHeadlessMode(): 'new' | boolean {
   const raw = (process.env.HEADLESS_MODE || '').trim().toLowerCase()
-  if (!raw) return 'new'
   if (raw === 'true') return true
   if (raw === 'false') return false
-  return 'new'
+  // 默认：puppeteer 21 用 'new'（新无头模式，渲染更准）；
+  // 22+ 已移除该取值，回退到 true（同样是新无头模式）。
+  return puppeteerMajor() >= 22 ? true : 'new'
 }
 
 async function launchBrowser(): Promise<Browser> {

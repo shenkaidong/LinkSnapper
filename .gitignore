@@ -38,4 +38,7 @@ yarn-error.log*
 
 # typescript
 *.tsbuildinfo
-next-env.d.ts 
+next-env.d.ts
+
+# install-chrome.mjs 写出的本地 Chrome 路径标记
+.chrome-executable-path

@@ -8,6 +8,7 @@ import {
   SAFE_INTERNAL_PROTOCOLS,
 } from '@/utils/url-guard'
 import { BoundedSemaphore, TokenBucketLimiter, getClientKey, QueueFullError, QueueTimeoutError } from '@/utils/rate-limit'
+import { createRateLimitBackend } from '@/utils/rate-limit-store'
 import { HttpError, readJsonBody } from '@/utils/http-error'
 import { isAuthorized } from '@/utils/auth'
 
@@ -40,7 +41,8 @@ const RATE_LIMIT_CAPACITY = Number(process.env.RATE_LIMIT_CAPACITY) || 6
 const RATE_LIMIT_REFILL_PER_SEC = Number(process.env.RATE_LIMIT_REFILL_PER_SEC) || 0.2
 
 const captureSemaphore = new BoundedSemaphore(MAX_CONCURRENT_CAPTURES, MAX_QUEUE_LENGTH, QUEUE_TIMEOUT_MS)
-const ipLimiter = new TokenBucketLimiter(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_PER_SEC)
+// 限流后端：默认进程内；设置 REDIS_URL 后自动切换为跨副本共享的 Redis 后端
+const ipLimiter = new TokenBucketLimiter(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_PER_SEC, createRateLimitBackend().backend)
 
 type WebsiteType = 'dynamic' | 'static' | 'spa'
 
@@ -145,7 +147,9 @@ function toHttpError(error: unknown): HttpError {
     return new HttpError(502, '目标站点证书校验失败')
   }
   if (message.includes('未找到可用的 Chrome')) {
-    return new HttpError(500, message)
+    // 这是部署/配置缺失，不是内部 bug —— 返回 503 比 500 更准确，
+    // 并且把安装命令透传给调用方，避免运维对着日志猜。
+    return new HttpError(503, `${message}\n运行 \`node scripts/install-chrome.mjs\` 安装匹配的 Chrome for Testing。`)
   }
 
   return new HttpError(500, '截图失败，请稍后重试')
@@ -468,7 +472,7 @@ export async function POST(request: Request) {
     }
 
     const clientKey = getClientKey(request)
-    const quota = ipLimiter.take(clientKey)
+    const quota = await ipLimiter.take(clientKey)
     if (!quota.allowed) {
       return Response.json(
         { success: false, error: '请求过于频繁，请稍后再试' },
@@ -494,25 +498,33 @@ export async function POST(request: Request) {
       maxSegments: normalizeMaxSegments(body.maxSegments ?? (body.singleShot || body.fullPage ? 1 : DEFAULT_MAX_SEGMENTS)),
     }
 
-    const result = await captureWithRetry(payload)
+    // 并发闸门：每个截图任务都要占一个 Chromium。队列满 / 等待超时抛出的
+    // QueueFullError / QueueTimeoutError 会被外层的 toHttpError 翻译成 503，
+    // 避免瞬间大量请求把内存打满（在内存受限的容器里尤其关键）。
+    const release = await captureSemaphore.acquire()
+    try {
+      const result = await captureWithRetry(payload)
 
-    return Response.json(
-      {
-        success: true,
-        // segments 是标准字段；screenshot 保留为第一段的别名，兼容旧调用方
-        segments: result.segments.map(segment => ({
-          offset: segment.offset,
-          height: segment.height,
-          image: segment.image,
-        })),
-        screenshot: result.segments[0]?.image ?? '',
-        isEnd: result.isEnd,
-        nextOffset: result.nextOffset,
-        pageHeight: result.pageHeight,
-        queue: { active: captureSemaphore.activeCount, waiting: captureSemaphore.waitingCount },
-      },
-      { headers: NO_STORE_HEADERS }
-    )
+      return Response.json(
+        {
+          success: true,
+          // segments 是标准字段；screenshot 保留为第一段的别名，兼容旧调用方
+          segments: result.segments.map(segment => ({
+            offset: segment.offset,
+            height: segment.height,
+            image: segment.image,
+          })),
+          screenshot: result.segments[0]?.image ?? '',
+          isEnd: result.isEnd,
+          nextOffset: result.nextOffset,
+          pageHeight: result.pageHeight,
+          queue: { active: captureSemaphore.activeCount, waiting: captureSemaphore.waitingCount },
+        },
+        { headers: NO_STORE_HEADERS }
+      )
+    } finally {
+      release()
+    }
   } catch (error) {
     const httpError = toHttpError(error)
     if (httpError.status >= 500) {

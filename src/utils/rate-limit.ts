@@ -5,66 +5,50 @@
  * 内存与 CPU 开销都在百 MB / 秒级。公网部署时如果不限流，几个人同时刷就能
  * 把机器打满，而且这类接口天然会被爬虫盯上。
  *
- * 这里用的都是进程内状态，够单实例部署使用；多实例部署时应换成 Redis 之类的
- * 共享存储，否则每个实例各限各的，实际额度会被放大 N 倍。
+ * 令牌桶状态默认存在进程内（单实例够用）；多实例部署时由 RateLimitBackend
+ * 切换到 Redis，所有副本共享同一份令牌桶，否则额度会被放大 N 倍。
  */
+
+import type { RateLimitBackend } from './rate-limit-store.ts'
+import { InMemoryBackend } from './rate-limit-store.ts'
 
 /** 令牌桶：按 key（一般是客户端 IP）限速，支持突发 */
 export class TokenBucketLimiter {
-  private readonly buckets = new Map<string, { tokens: number; updatedAt: number }>()
+  private readonly backend: RateLimitBackend
 
+  /**
+   * @param capacity 突发容量（令牌数）
+   * @param refillPerSecond 每秒补充速率
+   * @param backend 状态后端，默认进程内 Map；多实例部署传 RedisBackend
+   */
   constructor(
     private readonly capacity: number,
     private readonly refillPerSecond: number,
-    private readonly maxKeys = 20_000
-  ) {}
-
-  /**
-   * 尝试取走一个令牌。
-   * @returns allowed 是否放行；retryAfterSec 被拒时建议的等待秒数
-   */
-  take(key: string): { allowed: boolean; retryAfterSec: number; remaining: number } {
-    const now = Date.now()
-    let bucket = this.buckets.get(key)
-
-    if (!bucket) {
-      bucket = { tokens: this.capacity, updatedAt: now }
-      this.buckets.set(key, bucket)
-
-      if (this.buckets.size > this.maxKeys) {
-        this.evict(now)
-      }
-    } else {
-      const elapsedSec = (now - bucket.updatedAt) / 1000
-      bucket.tokens = Math.min(this.capacity, bucket.tokens + elapsedSec * this.refillPerSecond)
-      bucket.updatedAt = now
-    }
-
-    if (bucket.tokens >= 1) {
-      bucket.tokens -= 1
-      return { allowed: true, retryAfterSec: 0, remaining: Math.floor(bucket.tokens) }
-    }
-
-    const deficit = 1 - bucket.tokens
-    return {
-      allowed: false,
-      retryAfterSec: Math.max(1, Math.ceil(deficit / this.refillPerSecond)),
-      remaining: 0,
-    }
+    backend?: RateLimitBackend
+  ) {
+    this.backend = backend ?? new InMemoryBackend()
   }
 
-  /** 先回收已经完全回满的桶，实在不够再整体清空（宁可短暂放宽也不要无限增长） */
-  private evict(now: number): void {
-    const fullRefillMs = (this.capacity / this.refillPerSecond) * 1000
-    const expired: string[] = []
+  /**
+   * 尝试取走一个令牌（异步：Redis 后端需要网络往返）。
+   * @returns allowed 是否放行；retryAfterSec 被拒时建议的等待秒数
+   */
+  async take(key: string): Promise<{ allowed: boolean; retryAfterSec: number; remaining: number }> {
+    const now = Date.now()
+    // 桶的生存时间 = 回满所需时长 + 1s 余量，过期后由后端自动回收
+    const ttlMs = Math.ceil((this.capacity / this.refillPerSecond) * 1000) + 1000
 
-    // 用 forEach 而不是 for...of：tsconfig 的 target 是 es5，直接迭代 Map 编译不过
-    this.buckets.forEach((bucket, key) => {
-      if (now - bucket.updatedAt >= fullRefillMs) expired.push(key)
-    })
-    expired.forEach(key => this.buckets.delete(key))
+    const state = await this.backend.apply(key, this.capacity, this.refillPerSecond, 1, now, ttlMs)
 
-    if (this.buckets.size > this.maxKeys) this.buckets.clear()
+    if (state.tokens >= 0) {
+      return { allowed: true, retryAfterSec: 0, remaining: Math.floor(state.tokens) }
+    }
+
+    const deficit = -state.tokens
+    // refillPerSecond 为 0 表示「不补充」（测试或一次性配额），给一个兜底等待值避免 Infinity
+    const retryAfterSec =
+      this.refillPerSecond > 0 ? Math.max(1, Math.ceil(deficit / this.refillPerSecond)) : 3600
+    return { allowed: false, retryAfterSec, remaining: 0 }
   }
 }
 

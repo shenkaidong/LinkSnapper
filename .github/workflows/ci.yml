@@ -13,14 +13,19 @@ concurrency:
 
 jobs:
   # 快速门禁：类型 + 单元测试 + 构建。不需要浏览器，几十秒内出结果。
+  # 跨多个 Node 版本跑，尽早暴露「只在本机 Node 版本上才通过」的问题。
   verify:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node-version: [18, 20, 22]
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: ${{ matrix.node-version }}
           cache: npm
 
       - name: 安装依赖
@@ -36,9 +41,16 @@ jobs:
         run: npm run build
 
   # 端到端冒烟：需要真实浏览器，代价高，放在 verify 之后。
+  # 浏览器不再依赖发行版包，而是用 scripts/install-chrome.mjs 下载与
+  # puppeteer-core 锁定的同一个 Chrome-for-Testing 构建 —— 跨 ubuntu / macos
+  # 都拿到同一个版本，避免「CI 的 chromium 版本和系统对不上」这类漂移。
   smoke:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
 
@@ -50,15 +62,11 @@ jobs:
       - name: 安装依赖
         run: npm ci
 
-      - name: 确认浏览器可用
-        run: |
-          for bin in /usr/bin/google-chrome /usr/bin/google-chrome-stable /usr/bin/chromium /usr/bin/chromium-browser; do
-            if [ -x "$bin" ]; then echo "找到浏览器：$bin"; found=1; fi
-          done
-          if [ -z "${found:-}" ]; then
-            echo "运行环境未预装 Chrome，尝试安装 chromium"
-            sudo apt-get update -qq && sudo apt-get install -y -qq chromium-browser
-          fi
+      - name: 安装与 puppeteer-core 匹配的 Chrome
+        run: node scripts/install-chrome.mjs
+
+      - name: 设置 CHROME_PATH
+        run: echo "CHROME_PATH=$(cat .chrome-executable-path)" >> "$GITHUB_ENV"
 
       - name: 生产构建
         run: npm run build
@@ -70,15 +78,15 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: smoke-server-log
+          name: smoke-server-log-${{ matrix.os }}
           path: /tmp/linksnapper-smoke-server.log
           if-no-files-found: ignore
 
   # Docker 镜像校验。
   #
-  # 这个 job 的价值不只是「能不能构建」：镜像是本地唯一无法验证的部分，
-  # 而 alpine 自带的 Chromium 版本会随基础镜像漂移，一旦与 puppeteer-core 错位
-  # 就会出现「服务能起、但截图超时」这类不易察觉的故障。
+  # 这个 job 的价值不只是「能不能构建」：镜像是本地唯一无法验证的部分。
+  # 现在镜像内用 scripts/install-chrome.mjs 装的是与 puppeteer-core 锁定的
+  # Chrome 版本（基于 Debian/glibc，避免 Alpine/musl 与 Chrome 不兼容的历史坑），
   # 所以这里真的起容器并跑一遍完整截图冒烟，而不是只探一下健康接口。
   docker:
     runs-on: ubuntu-latest

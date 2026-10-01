@@ -30,8 +30,14 @@ LinkSnapper 是一个网页截图工具，针对动态加载站点、单页应�
 
 ## 环境要求
 
-- Node.js 18 或更高版本（单元测试需要 22.6+ 的 TypeScript 支持）
-- 本机已安装 Chrome / Chromium（或通过 `CHROME_PATH` 指定可执行文件路径）
+- Node.js 18.17+（推荐 20，已在 `.nvmrc` / `.node-version` 锁定）。CI 在 Node 18 / 20 / 22 上都会跑门禁。
+- 本机已安装 Chrome / Chromium，或通过环境变量 `CHROME_PATH` 指定可执行文件路径。
+  推荐直接用仓库自带的安装脚本装**与 puppeteer-core 锁定版本一致**的 Chrome for Testing：
+
+  ```bash
+  node scripts/install-chrome.mjs   # 装到 ~/.cache/puppeteer 并写 .chrome-executable-path
+  ```
+
 - Docker（可选，仅容器化部署需要）
 
 ## 快速开始
@@ -168,17 +174,21 @@ docker build -t linksnapper .
 docker run -d -p 3000:3000 --shm-size=1g linksnapper
 ```
 
-镜像基于 alpine，已装好 Chromium、中文字体与 sharp 所需的系统库，
-并用 tini 作为 PID 1 以回收 Chromium 产生的僵尸进程。
+镜像基于 **Debian（glibc）** 的 `node:20-bookworm-slim`。构建时会通过
+`scripts/install-chrome.mjs` 下载**与 puppeteer-core 锁定的同一个 Chrome for Testing
+构建**（121.0.6167.85），并软链到 `/usr/bin/chrome-for-testing`，同时装好 Chrome 运行所需的
+系统库、中文字体与 `tini`（作为 PID 1 回收 Chromium 僵尸进程）。
 `--shm-size=1g` 建议保留 —— Chromium 在默认 64MB 的 `/dev/shm` 下容易崩溃。
 
-> ⚠️ **升级基础镜像前请注意版本耦合**
-> 本项目用 `puppeteer-core` 驱动镜像里**系统自带的** Chromium，两者版本需要大致对应。
-> Alpine 的 chromium 包会随基础镜像版本变化，错位时可能出现「服务能起但截图超时」
-> 这类不易察觉的故障。构建时会把实际的 Chromium 版本打进日志（`chromium-browser --version`）；
-> CI 的 docker job 会真的起容器跑一遍截图冒烟来卡住这一点。
-> 如果它失败：回退基础镜像版本，或同步升级 `puppeteer-core`
->（后者注意 puppeteer 22+ 已移除 `headless: 'new'`，需同时设置 `HEADLESS_MODE=true`）。
+> ✅ **关于版本耦合（已从根本上解决）**
+> 旧版用 Alpine 自带的 `chromium` 包 + musl libc，而 Google 的 Chrome 只有 glibc 版本，
+> 加上发行版 chromium 版本会随基础镜像滚动，错位只是时间问题。现在的做法是：
+> 统一在 glibc 环境里下载与 `puppeteer-core` **同一版本号**的 Chrome for Testing，
+> 本地 / CI / Docker / k8s 全部一致。
+> 升级 `puppeteer-core` 时，只需同步更新 `scripts/install-chrome.mjs` 里的
+> `CHROME_VERSION`（取值来自 `node_modules/puppeteer-core/.../revisions.js` 的
+> `PUPPETEER_REVISIONS.chrome`），并重新构建镜像即可；`HEADLESS_MODE` 也已能按
+> puppeteer 主版本自动适配（22+ 自动回退 `true`，无需手工改代码）。
 
 ## 安全说明
 

@@ -10,37 +10,38 @@ import { test, describe } from 'node:test'
 import assert from 'node:assert/strict'
 
 import { TokenBucketLimiter, BoundedSemaphore, QueueFullError, QueueTimeoutError, getClientKey } from '../src/utils/rate-limit.ts'
+import { createRateLimitBackend, InMemoryBackend } from '../src/utils/rate-limit-store.ts'
 
 describe('TokenBucketLimiter', () => {
-  test('容量用尽前放行，用尽后拒绝', () => {
+  test('容量用尽前放行，用尽后拒绝', async () => {
     const limiter = new TokenBucketLimiter(3, 0)
 
-    assert.equal(limiter.take('ip').allowed, true)
-    assert.equal(limiter.take('ip').allowed, true)
-    assert.equal(limiter.take('ip').allowed, true)
+    assert.equal((await limiter.take('ip')).allowed, true)
+    assert.equal((await limiter.take('ip')).allowed, true)
+    assert.equal((await limiter.take('ip')).allowed, true)
 
-    const denied = limiter.take('ip')
+    const denied = await limiter.take('ip')
     assert.equal(denied.allowed, false)
     assert.ok(denied.retryAfterSec >= 1, '应给出建议等待秒数')
   })
 
-  test('不同 key 各用各的额度', () => {
+  test('不同 key 各用各的额度', async () => {
     const limiter = new TokenBucketLimiter(1, 0)
 
-    assert.equal(limiter.take('a').allowed, true)
-    assert.equal(limiter.take('a').allowed, false)
-    assert.equal(limiter.take('b').allowed, true)
+    assert.equal((await limiter.take('a')).allowed, true)
+    assert.equal((await limiter.take('a')).allowed, false)
+    assert.equal((await limiter.take('b')).allowed, true)
   })
 
   test('随时间补充令牌', async () => {
     // 容量 1，每秒补 50 个 —— 等 40ms 就足够回满
     const limiter = new TokenBucketLimiter(1, 50)
 
-    assert.equal(limiter.take('ip').allowed, true)
-    assert.equal(limiter.take('ip').allowed, false)
+    assert.equal((await limiter.take('ip')).allowed, true)
+    assert.equal((await limiter.take('ip')).allowed, false)
 
     await new Promise(resolve => setTimeout(resolve, 60))
-    assert.equal(limiter.take('ip').allowed, true, '等待后应恢复额度')
+    assert.equal((await limiter.take('ip')).allowed, true, '等待后应恢复额度')
   })
 
   test('补充不会超过容量上限', async () => {
@@ -48,9 +49,38 @@ describe('TokenBucketLimiter', () => {
     await new Promise(resolve => setTimeout(resolve, 30))
 
     // 即便过了很久，也只能拿到容量上限那么多
-    assert.equal(limiter.take('ip').allowed, true)
-    assert.equal(limiter.take('ip').allowed, true)
-    assert.equal(limiter.take('ip').allowed, false)
+    assert.equal((await limiter.take('ip')).allowed, true)
+    assert.equal((await limiter.take('ip')).allowed, true)
+    assert.equal((await limiter.take('ip')).allowed, false)
+  })
+
+  test('不补充（refill=0）被拒时给出有限等待值而非 Infinity', async () => {
+    const limiter = new TokenBucketLimiter(1, 0)
+    assert.equal((await limiter.take('ip')).allowed, true)
+    const denied = await limiter.take('ip')
+    assert.equal(denied.allowed, false)
+    assert.ok(Number.isFinite(denied.retryAfterSec), '等待秒数必须是有限值')
+  })
+})
+
+describe('RateLimitBackend', () => {
+  test('默认后端是进程内（单实例）', () => {
+    // 不设置 REDIS_URL 时一定是 memory 模式
+    const { mode } = createRateLimitBackend()
+    assert.equal(mode, 'memory')
+  })
+
+  test('InMemoryBackend 原子扣减后状态正确', async () => {
+    const backend = new InMemoryBackend()
+    const now = 1_000_000
+
+    // 首次：桶以 capacity 初始化再扣 1
+    const s1 = await backend.apply('k', 3, 0, 1, now, 10_000)
+    assert.equal(s1.tokens, 2)
+
+    // 第二次再扣 1
+    const s2 = await backend.apply('k', 3, 0, 1, now + 10, 10_000)
+    assert.equal(s2.tokens, 1)
   })
 })
 

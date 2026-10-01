@@ -30,8 +30,14 @@ LinkSnapper is a web screenshot tool that applies tailored loading strategies to
 
 ## Requirements
 
-- Node.js 18 or later (unit tests need 22.6+ for native TypeScript support)
-- A local Chrome / Chromium installation (or point `CHROME_PATH` at the binary)
+- Node.js 18.17+ (20 recommended; pinned in `.nvmrc` / `.node-version`). CI gates on Node 18 / 20 / 22.
+- A local Chrome / Chromium installation, or point `CHROME_PATH` at the binary.
+  The repo also ships a script that installs the exact Chrome for Testing build pinned to `puppeteer-core`:
+
+  ```bash
+  node scripts/install-chrome.mjs
+  ```
+
 - Docker (optional, for containerized deployment only)
 
 ## Getting started
@@ -174,18 +180,19 @@ docker build -t linksnapper .
 docker run -d -p 3000:3000 --shm-size=1g linksnapper
 ```
 
-The image is alpine-based and ships Chromium, CJK fonts, and the system libraries sharp needs.
-tini runs as PID 1 to reap zombie Chromium processes. Keep `--shm-size=1g` — Chromium crashes
-easily with the default 64MB `/dev/shm`.
+The image is based on **Debian (glibc)** `node:20-bookworm-slim`. The build runs
+`scripts/install-chrome.mjs` to download the exact Chrome for Testing build pinned to
+`puppeteer-core` (121.0.6167.85) and symlinks it to `/usr/bin/chrome-for-testing`, plus the
+system libraries Chrome needs, CJK fonts, and `tini` (PID 1 to reap zombie Chromium processes).
+Keep `--shm-size=1g` — Chromium crashes easily with the default 64MB `/dev/shm`.
 
-> ⚠️ **Version coupling — read before bumping the base image**
-> This project drives the **system** Chromium with `puppeteer-core`, so the two versions need to
-> roughly match. Alpine's chromium package moves with the base image, and a mismatch shows up as
-> "the service starts but captures time out" rather than an obvious crash. The build logs the
-> actual Chromium version (`chromium-browser --version`), and the CI docker job starts the
-> container and runs the full capture smoke suite to catch exactly this.
-> If that job fails: either roll the base image back, or bump `puppeteer-core` too
-> (note that puppeteer 22+ removed `headless: 'new'` — set `HEADLESS_MODE=true` in that case).
+> ✅ **Version coupling — solved at build time**
+> The old Alpine image shipped the distro `chromium` (musl) while Google's Chrome is glibc-only,
+> and the distro version drifted with the base image. Now every environment (local / CI / Docker /
+> k8s) downloads the *same* Chrome build that `puppeteer-core` expects. When you bump
+> `puppeteer-core`, just update `CHROME_VERSION` in `scripts/install-chrome.mjs` to match
+> `PUPPETEER_REVISIONS.chrome` and rebuild. `HEADLESS_MODE` also auto-adapts to the puppeteer major
+> (22+ falls back to `true`), so no code edit is needed on upgrade.
 
 ## Security notes
 
