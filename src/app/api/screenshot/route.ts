@@ -1,402 +1,307 @@
 import puppeteer, { Browser, Page } from 'puppeteer-core'
-import chrome from '@/utils/chrome'
+import getChromePath from '@/utils/chrome'
+import { assertSafeUrl } from '@/utils/url-guard'
+
+export const runtime = 'nodejs'
+export const dynamic = 'force-dynamic'
 
 const MAX_RETRIES = 3
-const RETRY_DELAY = 1000
+const RETRY_DELAY_MS = 1000
+const NAV_TIMEOUT_MS = 30000
+const PRELOAD_MAX_MS = 15000
+const SETTLE_MAX_MS = 6000
+const MAX_OFFSET = 500_000
+const MAX_CONCURRENT_BROWSERS = 3
 
-// 使用全局对象存储滚动位置
-const globalScrollPositions: { [key: string]: number } = {}
+type WebsiteType = 'dynamic' | 'static' | 'spa'
 
-async function sleep(ms: number) {
-  return new Promise(resolve => setTimeout(resolve, ms))
+interface ScreenshotPayload {
+  url: string
+  fullPage?: boolean
+  singleShot?: boolean
+  offset?: number
 }
 
-async function waitForDynamicContent(page: Page): Promise<boolean> {
-  return page.evaluate(async () => {
-    let previousHeight = document.documentElement.scrollHeight
-    let stabilityCount = 0
-    const maxStabilityChecks = 5
-
-    // 等待内容稳定
-    while (stabilityCount < maxStabilityChecks) {
-      await new Promise(resolve => setTimeout(resolve, 500))
-      
-      // 检查高度变化
-      const currentHeight = document.documentElement.scrollHeight
-      if (currentHeight === previousHeight) {
-        stabilityCount++
-      } else {
-        stabilityCount = 0
-        previousHeight = currentHeight
-      }
-
-      // 检查动态加载指示器
-      const loadingElements = document.querySelectorAll([
-        '.loading', // 常见的加载类名
-        '[data-loading]',
-        '.infinite-loading',
-        '.spinner',
-        // B站特定的加载指示器
-        '.bili-spinner',
-        '.loading-state'
-      ].join(','))
-
-      if (loadingElements.length > 0) {
-        stabilityCount = 0 // 重置稳定计数
-      }
-    }
-
-    return true
-  })
+interface ScreenshotResult {
+  screenshot: string
+  isEnd: boolean
+  nextOffset: number
 }
 
-async function scrollAndWaitForContent(page: Page, targetPosition: number): Promise<boolean> {
-  return page.evaluate(async (target: number) => {
-    // 首先直接滚动到目标位置
-    window.scrollTo(0, target)
-    await new Promise(resolve => setTimeout(resolve, 500))
+const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 
-    // 检查是否到达目标位置
-    const finalPosition = window.pageYOffset
-    const viewportHeight = window.innerHeight
-    const pageHeight = Math.max(
-      document.documentElement.scrollHeight,
-      document.body.scrollHeight,
-      document.documentElement.offsetHeight
-    )
+/**
+ * 浏览器实例很吃内存，这里做一层进程内并发闸门，防止并发请求把机器打爆。
+ * 注意这是进程内的，多实例部署时每个实例各限各的。
+ */
+let activeBrowsers = 0
+const waitingForSlot: Array<() => void> = []
 
-    // 更宽松的滚动检查条件
-    const isNearBottom = finalPosition + viewportHeight >= pageHeight - viewportHeight
-    // 如果未能达到目标位置，但仍在可接受范围内
-    const reachedTarget = Math.abs(finalPosition - target) < viewportHeight
+async function acquireBrowserSlot(): Promise<() => void> {
+  while (activeBrowsers >= MAX_CONCURRENT_BROWSERS) {
+    await new Promise<void>(resolve => waitingForSlot.push(resolve))
+  }
+  activeBrowsers++
 
-    // 对于静态网站，只要没到底部就继续
-    return !isNearBottom
-  }, targetPosition)
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    activeBrowsers--
+    waitingForSlot.shift()?.()
+  }
 }
 
-// 添加网站类型检测函数
-async function detectWebsiteType(page: Page, url: string): Promise<'dynamic' | 'static' | 'spa'> {
-  // 检查是否为已知的动态网站
-  const dynamicSites = [
-    'bilibili.com',
-    'zhihu.com',
-    'weibo.com',
-    'douyin.com'
+/** 已知的动态加载站点，走更长的等待策略 */
+const KNOWN_DYNAMIC_SITES = ['bilibili.com', 'zhihu.com', 'weibo.com', 'douyin.com', 'xiaohongshu.com']
+
+const LOADING_SELECTORS = [
+  '.loading',
+  '[data-loading]',
+  '.infinite-loading',
+  '.spinner',
+  '.loader',
+  '.bili-spinner',
+  '.loading-state',
+].join(',')
+
+function normalizeOffset(value: unknown): number {
+  const parsed = typeof value === 'number' ? value : Number.parseInt(String(value ?? ''), 10)
+  if (!Number.isFinite(parsed) || parsed <= 0) return 0
+  return Math.min(Math.trunc(parsed), MAX_OFFSET)
+}
+
+/**
+ * 判断一次失败是否值得重试。
+ * 域名不存在、地址非法、被浏览器直接拒绝这类错误重试多少次结果都一样，
+ * 而超时、连接被重置这类则往往是瞬时的，值得重试。
+ */
+function isRetryable(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  const permanentPatterns = [
+    'ERR_NAME_NOT_RESOLVED',
+    'ERR_INVALID_URL',
+    'ERR_INVALID_ARGUMENT',
+    'ERR_UNSAFE_PORT',
+    'ERR_BLOCKED_BY_CLIENT',
+    'ERR_ADDRESS_INVALID',
   ]
-  
-  if (dynamicSites.some(site => url.includes(site))) {
+  return !permanentPatterns.some(pattern => message.includes(pattern))
+}
+
+async function detectWebsiteType(page: Page, url: string): Promise<WebsiteType> {
+  if (KNOWN_DYNAMIC_SITES.some(site => url.includes(site))) {
     return 'dynamic'
   }
 
-  // 检查是否为单页应用
-  const isSPA = await page.evaluate(() => {
-    return (
-      typeof window.history.pushState === 'function' &&
-      !!document.querySelector('div[id="app"], div[id="root"]')
-    )
-  })
-  
-  if (isSPA) {
-    return 'spa'
-  }
-
-  return 'static'
-}
-
-// 添加页面加载完成检测函数
-async function waitForPageLoad(page: Page, websiteType: 'dynamic' | 'static' | 'spa'): Promise<void> {
-  switch (websiteType) {
-    case 'dynamic':
-      // 动态网站需要等待更长时间和更多条件
-      await Promise.race([
-        Promise.all([
-          page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 15000 }).catch(() => {}),
-          page.waitForFunction(() => {
-            const loadingElements = document.querySelectorAll(
-              '.loading, .loader, .spinner, [data-loading], .infinite-loading, .bili-spinner, .loading-state'
-            )
-            return loadingElements.length === 0
-          }, { timeout: 15000 }).catch(() => {})
-        ]),
-        page.waitForTimeout(15000) // 最大等待时间
-      ])
-      break
-      
-    case 'spa':
-      // SPA 需要等待前端路由和数据加载
-      await Promise.race([
-        Promise.all([
-          page.waitForNavigation({ waitUntil: 'networkidle0', timeout: 10000 }).catch(() => {}),
-          page.waitForFunction(() => {
-            return !document.querySelector('.loading, .loader, .spinner')
-          }, { timeout: 10000 }).catch(() => {})
-        ]),
-        page.waitForTimeout(10000)
-      ])
-      break
-      
-    case 'static':
-      // 静态网站只需等待基本加载
-      await page.waitForNavigation({ 
-        waitUntil: ['domcontentloaded', 'networkidle0'],
-        timeout: 8000 
-      }).catch(() => {})
-      break
-  }
-}
-
-async function takeScreenshot(url: string, fullPage: boolean, retryCount = 0, singleShot = false): Promise<{ screenshot: string; isEnd: boolean }> {
-  let browser: Browser | null = null
-  
-  try {
-    const executablePath = await chrome()
-    browser = await puppeteer.launch({
-      executablePath,
-      headless: "new",
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-accelerated-2d-canvas',
-        '--disable-gpu',
-        '--window-size=1920,1080',
-        '--disable-web-security',
-        '--disable-features=IsolateOrigins,site-per-process',
-        '--disable-background-timer-throttling',
-        '--disable-backgrounding-occluded-windows',
-        '--disable-breakpad',
-        '--disable-component-extensions-with-background-pages',
-        '--disable-extensions',
-        '--disable-features=TranslateUI',
-        '--disable-ipc-flooding-protection',
-        '--disable-renderer-backgrounding',
-        '--enable-features=NetworkService,NetworkServiceInProcess',
-        '--force-color-profile=srgb',
-        '--metrics-recording-only',
-        '--mute-audio',
-        '--no-first-run',
-        '--no-default-browser-check',
-        '--no-experiments',
-        '--no-pings',
-        '--ignore-certificate-errors',
-        '--ignore-ssl-errors',
-        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
-      ],
-      defaultViewport: {
-        width: 1920,
-        height: 1080,
-        deviceScaleFactor: 1,
-      },
-      protocolTimeout: 30000,
+  const isSpa = await page
+    .evaluate(() => {
+      return (
+        typeof window.history.pushState === 'function' &&
+        !!document.querySelector('div[id="app"], div[id="root"], div[id="__next"]')
+      )
     })
+    .catch(() => false)
 
+  return isSpa ? 'spa' : 'static'
+}
+
+/** 等待动态内容稳定：页面高度不再变化且没有加载指示器，最多等 maxMs */
+async function waitForDynamicContent(page: Page, maxMs = SETTLE_MAX_MS): Promise<void> {
+  await page
+    .evaluate(
+      async (limit: number, loadingSelector: string) => {
+        const startedAt = Date.now()
+        let previousHeight = document.documentElement.scrollHeight
+        let stableRounds = 0
+
+        while (Date.now() - startedAt < limit && stableRounds < 3) {
+          await new Promise(resolve => setTimeout(resolve, 400))
+          const currentHeight = document.documentElement.scrollHeight
+          const loadingCount = document.querySelectorAll(loadingSelector).length
+
+          if (currentHeight === previousHeight && loadingCount === 0) {
+            stableRounds++
+          } else {
+            stableRounds = 0
+            previousHeight = currentHeight
+          }
+        }
+      },
+      maxMs,
+      LOADING_SELECTORS
+    )
+    .catch(() => {})
+}
+
+/**
+ * 预加载懒加载内容：滚到底再回到顶部，让懒加载 / 无限滚动的区块都渲染出来。
+ * 原实现用 while(true)，遇到无限滚动站点会一直转下去，这里加了时间上限。
+ */
+async function preloadLazyContent(page: Page, maxMs = PRELOAD_MAX_MS): Promise<void> {
+  await page
+    .evaluate(
+      async (limit: number) => {
+        const startedAt = Date.now()
+        const step = Math.max(200, Math.floor(window.innerHeight * 0.8))
+        let lastY = -1
+
+        while (Date.now() - startedAt < limit) {
+          window.scrollBy(0, step)
+          await new Promise(resolve => setTimeout(resolve, 150))
+
+          const y = window.pageYOffset
+          const atBottom = y + window.innerHeight >= document.documentElement.scrollHeight - 2
+
+          if (y === lastY) break // 已经滚不动了
+          lastY = y
+          if (atBottom) await new Promise(resolve => setTimeout(resolve, 300))
+        }
+
+        window.scrollTo(0, 0)
+        await new Promise(resolve => setTimeout(resolve, 200))
+      },
+      maxMs
+    )
+    .catch(() => {})
+}
+
+async function settlePage(page: Page, type: WebsiteType): Promise<void> {
+  const timeout = type === 'static' ? 8000 : 15000
+
+  // 注意：这里不能再用 page.waitForTimeout，该 API 在 puppeteer 22 中已被移除
+  await page
+    .waitForFunction(() => document.readyState === 'complete' || document.readyState === 'interactive', { timeout })
+    .catch(() => {})
+
+  if (type === 'static') {
+    await sleep(500)
+  } else {
+    await waitForDynamicContent(page)
+  }
+}
+
+async function measurePage(page: Page) {
+  return page.evaluate(() => ({
+    pageHeight: Math.max(
+      document.documentElement.scrollHeight,
+      document.body ? document.body.scrollHeight : 0,
+      document.documentElement.offsetHeight
+    ),
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+  }))
+}
+
+async function launchBrowser(): Promise<Browser> {
+  const executablePath = await getChromePath()
+
+  return puppeteer.launch({
+    executablePath,
+    headless: 'new',
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-accelerated-2d-canvas',
+      '--disable-gpu',
+      '--hide-scrollbars',
+      '--window-size=1920,1080',
+      '--disable-background-timer-throttling',
+      '--disable-backgrounding-occluded-windows',
+      '--disable-breakpad',
+      '--disable-component-extensions-with-background-pages',
+      '--disable-extensions',
+      '--disable-ipc-flooding-protection',
+      '--disable-renderer-backgrounding',
+      // 只允许出现一次 --disable-features，重复出现时后一个的值会覆盖前一个。
+      // 同时刻意移除了 --disable-web-security：它会关闭同源策略，
+      // 配合「任意 URL 都能访问」的截图能力，等于把 SSRF 放大。
+      '--disable-features=TranslateUI',
+      '--enable-features=NetworkService,NetworkServiceInProcess',
+      '--force-color-profile=srgb',
+      '--metrics-recording-only',
+      '--mute-audio',
+      '--no-first-run',
+      '--no-default-browser-check',
+      '--no-pings',
+      '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    ],
+    defaultViewport: {
+      width: 1920,
+      height: 1080,
+      deviceScaleFactor: 1,
+    },
+    protocolTimeout: NAV_TIMEOUT_MS,
+  })
+}
+
+async function captureOnce(payload: ScreenshotPayload, target: URL): Promise<ScreenshotResult> {
+  const release = await acquireBrowserSlot()
+  let browser: Browser | null = null
+
+  try {
+    browser = await launchBrowser()
     const page = await browser.newPage()
-    
-    // 设置更长的导航超时
-    await page.setDefaultNavigationTimeout(30000)
-    await page.setDefaultTimeout(30000)
 
-    // 设置额外的请求头
+    await page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS)
+    await page.setDefaultTimeout(NAV_TIMEOUT_MS)
     await page.setExtraHTTPHeaders({
       'Accept-Language': 'zh-CN,zh;q=0.9',
-      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
-      'Accept-Encoding': 'gzip, deflate, br',
-      'Cache-Control': 'no-cache',
-      'Pragma': 'no-cache',
     })
 
-    // 启用 JavaScript
-    await page.setJavaScriptEnabled(true)
+    await page.goto(target.toString(), { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS })
 
-    // 设置 cookie
-    await page.setCookie({
-      name: 'CONSENT',
-      value: 'YES+',
-      domain: '.bilibili.com',
-    })
+    const websiteType = await detectWebsiteType(page, target.toString())
+    await settlePage(page, websiteType)
 
-    // 访问页面
-    await page.goto(url, { waitUntil: 'domcontentloaded' })
-
-    // 检测网站类型
-    const websiteType = await detectWebsiteType(page, url)
-    console.log('Detected website type:', websiteType)
-
-    // 等待页面加载完成
-    await waitForPageLoad(page, websiteType)
-
-    if (fullPage) {
-      // 全页面截图逻辑
-      if (websiteType === 'dynamic' || websiteType === 'spa') {
-        // 动态网站需要预加载内容
-        await page.evaluate(async () => {
-          const scrollStep = 200
-          let lastScroll = 0
-          
-          while (true) {
-            window.scrollBy(0, scrollStep)
-            await new Promise(resolve => setTimeout(resolve, 100))
-            
-            const currentScroll = window.pageYOffset
-            if (currentScroll === lastScroll) {
-              break
-            }
-            lastScroll = currentScroll
-          }
-          
-          window.scrollTo(0, 0)
-        })
-        
-        // 等待动态内容加载
+    // ---- 整页截图 ----
+    if (payload.fullPage) {
+      if (websiteType !== 'static') {
+        await preloadLazyContent(page)
         await waitForDynamicContent(page)
       }
 
-      // 截取整个页面
       const screenshot = await page.screenshot({
         fullPage: true,
         type: 'png',
         optimizeForSpeed: true,
-        encoding: 'base64'
+        encoding: 'base64',
       })
 
-      await browser.close()
-      return {
-        screenshot: screenshot as string,
-        isEnd: true
-      }
+      return { screenshot: screenshot as string, isEnd: true, nextOffset: 0 }
     }
 
-    // 如果是普通截图（单次截图），直接截取当前视口
-    if (singleShot) {
+    // ---- 普通单次截图 ----
+    if (payload.singleShot) {
       const screenshot = await page.screenshot({
         fullPage: false,
         type: 'png',
         optimizeForSpeed: true,
-        encoding: 'base64'
+        encoding: 'base64',
       })
 
-      await browser.close()
-      return {
-        screenshot: screenshot as string,
-        isEnd: true
-      }
+      return { screenshot: screenshot as string, isEnd: true, nextOffset: 0 }
     }
 
-    // 获取上次滚动位置
-    const lastPosition = globalScrollPositions[url] || 0
-    console.log('Last scroll position:', lastPosition)
+    // ---- 分段截图 ----
+    // 滚动位置由前端通过 offset 传入，服务端不再保存任何会话状态，
+    // 这样多实例部署、重启、并发请求都不会互相污染。
+    const offset = normalizeOffset(payload.offset)
 
-    // 获取初始页面信息
-    const { viewportHeight, initialHeight } = await page.evaluate(() => ({
-      viewportHeight: window.innerHeight,
-      initialHeight: document.documentElement.scrollHeight
-    }))
-
-    // 根据网站类型采用不同的截图策略
-    if (websiteType === 'dynamic') {
-      // 动态网站需要预加载内容
-      await page.evaluate(async () => {
-        const scrollStep = 200
-        let lastScroll = 0
-        
-        while (true) {
-          window.scrollBy(0, scrollStep)
-          await new Promise(resolve => setTimeout(resolve, 100))
-          
-          const currentScroll = window.pageYOffset
-          if (currentScroll === lastScroll) {
-            break
-          }
-          lastScroll = currentScroll
-        }
-        
-        window.scrollTo(0, 0)
-      })
-      
-      // 等待动态内容加载
-      await waitForDynamicContent(page)
+    if (websiteType !== 'static') {
+      await preloadLazyContent(page)
     }
 
-    // 计算新的滚动位置
-    const newPosition = lastPosition + viewportHeight
-    console.log('New scroll position:', newPosition)
+    const { pageHeight, viewportWidth, viewportHeight } = await measurePage(page)
 
-    // 根据网站类型执行滚动
-    if (websiteType === 'dynamic' || websiteType === 'spa') {
-      // 先滚动到上次的位置
-      await page.evaluate((pos) => window.scrollTo(0, pos), lastPosition)
-      await waitForDynamicContent(page)
-      
-      // 滚动到新位置
-      await page.evaluate((pos) => window.scrollTo(0, pos), newPosition)
-      await waitForDynamicContent(page)
-      
-      // 检查是否可以继续滚动
-      const canContinueScroll = await page.evaluate(() => {
-        const scrollPosition = window.pageYOffset + window.innerHeight
-        const totalHeight = Math.max(
-          document.documentElement.scrollHeight,
-          document.body.scrollHeight,
-          document.documentElement.offsetHeight
-        )
-        return scrollPosition < totalHeight - 100 // 留出一些余量
-      })
-
-      if (!canContinueScroll) {
-        console.log('Reached the bottom of dynamic/spa content')
-        await browser.close()
-        return {
-          screenshot: '',
-          isEnd: true
-        }
-      }
-    } else {
-      // 静态网站使用简单的滚动检查
-      await page.evaluate((pos) => window.scrollTo(0, pos), newPosition)
-      await page.waitForTimeout(500)
-      
-      // 检查是否到达页面底部
-      const isAtBottom = await page.evaluate(() => {
-        const scrollPosition = window.pageYOffset + window.innerHeight
-        const totalHeight = document.documentElement.scrollHeight
-        const isAtVeryBottom = scrollPosition >= totalHeight - 10
-        const hasScrolled = window.pageYOffset > 0
-        // 只有当真正到达底部并且已经滚动过才返回true
-        return isAtVeryBottom && hasScrolled
-      })
-      
-      if (isAtBottom) {
-        console.log('Reached the bottom of static content')
-        await browser.close()
-        return {
-          screenshot: '',
-          isEnd: true
-        }
-      }
+    if (offset >= pageHeight) {
+      return { screenshot: '', isEnd: true, nextOffset: offset }
     }
 
-    // 获取最终页面高度和当前滚动位置
-    const { finalHeight, currentScrollY } = await page.evaluate(() => ({
-      finalHeight: document.documentElement.scrollHeight,
-      currentScrollY: window.pageYOffset
-    }))
+    // 最后一段按剩余高度裁剪，避免 clip 越出页面边界导致截图报错
+    const height = Math.max(1, Math.min(viewportHeight, pageHeight - offset))
 
-    // 静态页面不检查内容变化
-    if (websiteType !== 'static' && (finalHeight < initialHeight || finalHeight === 0)) {
-      console.log('No valid content detected')
-      await browser.close()
-      return {
-        screenshot: '',
-        isEnd: true
-      }
-    }
-
-    // 保存新的滚动位置
-    globalScrollPositions[url] = newPosition
-    console.log('Saved new scroll position:', newPosition)
-
-    // 截图当前视口
     const screenshot = await page.screenshot({
       fullPage: false,
       type: 'png',
@@ -404,58 +309,75 @@ async function takeScreenshot(url: string, fullPage: boolean, retryCount = 0, si
       encoding: 'base64',
       clip: {
         x: 0,
-        y: lastPosition === 0 ? 0 : currentScrollY, // 如果是第一次截图，从顶部开始；否则使用当前滚动位置
-        width: 1920,
-        height: viewportHeight
-      }
+        y: offset,
+        width: Math.max(1, viewportWidth),
+        height,
+      },
     })
 
-    await browser.close()
+    const nextOffset = offset + height
     return {
       screenshot: screenshot as string,
-      isEnd: false
+      isEnd: nextOffset >= pageHeight,
+      nextOffset,
     }
-
-  } catch (error) {
+  } finally {
     if (browser) {
-      await browser.close()
+      await browser.close().catch(() => {})
     }
-
-    if (retryCount < MAX_RETRIES) {
-      console.log(`Retrying screenshot (${retryCount + 1}/${MAX_RETRIES})...`)
-      await sleep(RETRY_DELAY)
-      return takeScreenshot(url, fullPage, retryCount + 1)
-    }
-
-    throw error
+    release()
   }
+}
+
+/** 统一重试入口：保证每次重试都带上完整参数（原实现在递归时漏传了 singleShot） */
+async function captureWithRetry(payload: ScreenshotPayload, target: URL): Promise<ScreenshotResult> {
+  let lastError: unknown
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      return await captureOnce(payload, target)
+    } catch (error) {
+      lastError = error
+      // 域名解析失败、无效地址这类属于确定性错误，重试只会白白拖长响应时间
+      if (!isRetryable(error) || attempt === MAX_RETRIES) break
+
+      console.warn(`截图失败，正在重试 (${attempt + 1}/${MAX_RETRIES})：`, error)
+      await sleep(RETRY_DELAY_MS)
+    }
+  }
+
+  throw lastError instanceof Error ? lastError : new Error('截图失败，请稍后重试')
 }
 
 export async function POST(request: Request) {
-  const { url, fullPage = false, singleShot = false } = await request.json()
-  
+  let body: ScreenshotPayload
+
   try {
-    // 如果是普通截图（单次截图），清除之前的滚动位置
-    if (singleShot) {
-      delete globalScrollPositions[url]
+    body = await request.json()
+  } catch {
+    return Response.json({ success: false, error: '请求体不是合法的 JSON' }, { status: 400 })
+  }
+
+  try {
+    const target = assertSafeUrl(body?.url)
+    const payload: ScreenshotPayload = {
+      url: target.toString(),
+      fullPage: Boolean(body.fullPage),
+      singleShot: Boolean(body.singleShot),
+      offset: normalizeOffset(body.offset),
     }
-    
-    const result = await takeScreenshot(url, fullPage, 0, singleShot)
-    return Response.json({ 
-      success: true, 
+
+    const result = await captureWithRetry(payload, target)
+
+    return Response.json({
+      success: true,
       screenshot: result.screenshot,
-      isEnd: result.isEnd 
+      isEnd: result.isEnd,
+      nextOffset: result.nextOffset,
     })
-  } catch (error: any) {
+  } catch (error) {
+    const message = error instanceof Error ? error.message : '截图失败，请稍后重试'
     console.error('Screenshot error:', error)
-    return Response.json({ success: false, error: error.message })
+    return Response.json({ success: false, error: message }, { status: 400 })
   }
 }
-
-export async function DELETE(request: Request) {
-  // 清除滚动位置记录
-  Object.keys(globalScrollPositions).forEach(key => {
-    delete globalScrollPositions[key]
-  })
-  return Response.json({ success: true })
-} 

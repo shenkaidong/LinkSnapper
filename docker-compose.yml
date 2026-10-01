@@ -1,12 +1,17 @@
-version: '3'
+# 生产部署用的 compose 配置。
+# 注意：这里刻意不挂载源码目录 —— 镜像里已经装好依赖并完成构建，
+# 挂载 .:/app 会用本地源码覆盖掉这些产物，导致容器起不来。
 services:
   web:
     build: .
+    image: linksnapper:latest
+    container_name: linksnapper
     ports:
       - "3000:3000"
     environment:
       - NODE_ENV=production
-    volumes:
-      - .:/app
-      - /app/node_modules
-      - /app/.next 
+      # 允许截图内网地址时改为 true（默认禁止，防 SSRF）
+      - ALLOW_PRIVATE_NETWORK=false
+    # Chromium 对 /dev/shm 需求较大，默认 64MB 容易导致标签页崩溃
+    shm_size: "1gb"
+    restart: unless-stopped
