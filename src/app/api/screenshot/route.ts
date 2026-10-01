@@ -1,5 +1,14 @@
-import { Page } from 'puppeteer-core'
+import { ElementHandle, Page } from 'puppeteer-core'
+import sharp from 'sharp'
 import { withPage } from '@/services/browser'
+import {
+  CONTENT_TYPES,
+  encodeImage,
+  parseClip,
+  parseFormat,
+  parseQuality,
+  parseSelector,
+} from '@/utils/screenshot-params'
 import {
   assertSafeUrl,
   isBlockedHostname,
@@ -52,6 +61,10 @@ interface ScreenshotPayload {
   singleShot?: boolean
   offset?: number
   maxSegments?: number
+  selector?: string | null
+  clip?: { x: number; y: number; width: number; height: number } | null
+  format: 'png' | 'jpeg' | 'webp'
+  quality: number
 }
 
 interface CapturedSegment {
@@ -363,6 +376,44 @@ async function captureOnce(payload: ScreenshotPayload): Promise<CaptureOutcome> 
     const websiteType = await detectWebsiteType(page, target)
     await settlePage(page, websiteType)
 
+    // ---- 元素级截图 ----
+    // 优先级最高：只截匹配到的第一个元素（整元素，可超出视口）。
+    if (payload.selector) {
+      const element: ElementHandle<Element> | null = await page.$(payload.selector)
+      if (!element) {
+        throw new HttpError(400, `selector "${payload.selector}" 未匹配到任何元素`)
+      }
+
+      const png = (await element.screenshot({ type: 'png', captureBeyondViewport: true })) as Buffer
+      const meta = await sharp(png).metadata()
+      const image = (await encodeImage(png, payload.format, payload.quality)).toString('base64')
+
+      return {
+        segments: [{ offset: 0, height: meta.height ?? 0, image }],
+        isEnd: true,
+        nextOffset: 0,
+        pageHeight: meta.height ?? 0,
+      }
+    }
+
+    // ---- 手动区域截图 ----
+    // 坐标以页面左上角为原点，单位 CSS 像素；captureBeyondViewport 允许裁到视口之外。
+    if (payload.clip) {
+      const png = (await page.screenshot({
+        type: 'png',
+        captureBeyondViewport: true,
+        clip: payload.clip,
+      })) as Buffer
+      const image = (await encodeImage(png, payload.format, payload.quality)).toString('base64')
+
+      return {
+        segments: [{ offset: 0, height: payload.clip.height, image }],
+        isEnd: true,
+        nextOffset: 0,
+        pageHeight: payload.clip.height,
+      }
+    }
+
     // ---- 整页截图 ----
     if (payload.fullPage) {
       if (websiteType !== 'static') {
@@ -380,25 +431,25 @@ async function captureOnce(payload: ScreenshotPayload): Promise<CaptureOutcome> 
 
       // 这里走 puppeteer 自己的 fullPage 路径（内部同样按内容尺寸裁剪），
       // 比自己算 clip 更稳，也不受页面滚动位置影响。
-      const image = (await page.screenshot({
+      const png = (await page.screenshot({
         fullPage: true,
         type: 'png',
         optimizeForSpeed: true,
-        encoding: 'base64',
-      })) as string
+      })) as Buffer
+      const image = (await encodeImage(png, payload.format, payload.quality)).toString('base64')
 
       return { segments: [{ offset: 0, height: pageHeight, image }], isEnd: true, nextOffset: 0, pageHeight }
     }
 
     // ---- 普通单次截图（当前视口）----
     if (payload.singleShot) {
-      const image = (await page.screenshot({
+      const png = (await page.screenshot({
         fullPage: false,
         type: 'png',
         optimizeForSpeed: true,
-        encoding: 'base64',
         captureBeyondViewport: false,
-      })) as string
+      })) as Buffer
+      const image = (await encodeImage(png, payload.format, payload.quality)).toString('base64')
 
       return { segments: [{ offset: 0, height: 0, image }], isEnd: true, nextOffset: 0, pageHeight: 0 }
     }
@@ -489,13 +540,33 @@ export async function POST(request: Request) {
       throw new HttpError(400, error instanceof Error ? error.message : 'url 参数不合法')
     }
 
+    // 精细化截图参数：格式 / 质量 / 选择器 / 裁剪区域。
+    // 解析放到这里而不是 captureOnce 里，是为了让非法参数尽早以 400 失败，
+    // 不必先拉起 Chromium 才报错（省一次昂贵的浏览器启动）。
+    const format = parseFormat(body.format)
+    const quality = parseQuality(body.quality, format)
+    const selector = parseSelector(body.selector)
+    const clip = parseClip(body.clip)
+
+    // 优先级：selector > clip > fullPage > singleShot > 分段。
+    // selector / clip 会隐式覆盖整页与视口模式，避免语义冲突。
+    const fullPage = Boolean(body.fullPage) && !selector && !clip
+    const singleShot = Boolean(body.singleShot) && !selector && !clip && !fullPage
+
+    // 分段模式恒为 PNG；其余模式按 format 输出。
+    const effectiveFormat = selector || clip || fullPage || singleShot ? format : 'png'
+
     // 挂起的排队请求数也一并回传，方便运维侧观察压力
     const payload: ScreenshotPayload = {
       url: target.toString(),
-      fullPage: Boolean(body.fullPage),
-      singleShot: Boolean(body.singleShot),
+      fullPage,
+      singleShot,
       offset: normalizeOffset(body.offset),
-      maxSegments: normalizeMaxSegments(body.maxSegments ?? (body.singleShot || body.fullPage ? 1 : DEFAULT_MAX_SEGMENTS)),
+      maxSegments: normalizeMaxSegments(body.maxSegments ?? (singleShot || fullPage ? 1 : DEFAULT_MAX_SEGMENTS)),
+      selector,
+      clip,
+      format,
+      quality,
     }
 
     // 并发闸门：每个截图任务都要占一个 Chromium。队列满 / 等待超时抛出的
@@ -513,12 +584,15 @@ export async function POST(request: Request) {
             offset: segment.offset,
             height: segment.height,
             image: segment.image,
+            format: effectiveFormat,
           })),
           screenshot: result.segments[0]?.image ?? '',
           isEnd: result.isEnd,
           nextOffset: result.nextOffset,
           pageHeight: result.pageHeight,
           queue: { active: captureSemaphore.activeCount, waiting: captureSemaphore.waitingCount },
+          format: effectiveFormat,
+          contentType: CONTENT_TYPES[effectiveFormat],
         },
         { headers: NO_STORE_HEADERS }
       )

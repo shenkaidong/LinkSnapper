@@ -130,9 +130,18 @@ Request body:
   "singleShot": false,    // true = capture the current viewport only
   "fullPage": false,      // true = full-page capture
   "offset": 0,            // vertical start position for paged capture
-  "maxSegments": 6        // paged mode: how many segments to return per request (1–12), default 6
+  "maxSegments": 6,       // paged mode: how many segments to return per request (1–12), default 6
+  "selector": null,       // CSS selector: capture only the first matching element (full element, may exceed viewport); highest priority
+  "clip": null,           // manual crop {x,y,width,height} in page coordinates (CSS px); overrides fullPage/singleShot
+  "format": "png",        // output format: png / jpeg / webp, default png
+  "quality": 80           // jpeg / webp quality 1–100, default 80 (ignored for png)
 }
 ```
+
+Parameter precedence: `selector` > `clip` > `fullPage` > `singleShot` > paged.
+`selector` / `clip` return a single image (no paging/merge) and are still covered by the two-layer SSRF guard.
+`format` applies to viewport / full-page / element / region captures; paged mode always returns PNG to stay
+compatible with `/api/merge`. The response also includes `format` and `contentType` for correct decoding.
 
 Response:
 

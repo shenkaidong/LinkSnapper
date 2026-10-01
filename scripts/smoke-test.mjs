@@ -406,6 +406,75 @@ async function testSingleShot() {
   check('顶部颜色对应 y=0', colorsClose(pixelAt(raw, 10, 0), bandColorAt(0)), formatColor(pixelAt(raw, 10, 0), bandColorAt(0)))
 }
 
+async function testPreciseShot() {
+  section('精细化截图：selector / clip / format')
+
+  // ---- selector：只截单个元素 ----
+  const sel = await post('/api/screenshot', { url: FIXTURE_URL, selector: '[data-index="3"]' })
+  if (!sel.data?.success) {
+    check('selector 截图成功', false, sel.data?.error || '')
+  } else {
+    check('selector 截图成功', true)
+    const raw = await loadRaw(sel.data.screenshot)
+    check('selector 元素高度为 60px', raw.height === 60, `实际 ${raw.height}`)
+    const top = pixelAt(raw, 10, 0)
+    check('selector 顶部颜色对应 band #3', colorsClose(top, bandColorAt(180)), formatColor(top, bandColorAt(180)))
+  }
+
+  const selMiss = await post('/api/screenshot', { url: FIXTURE_URL, selector: '.does-not-exist' })
+  check(
+    'selector 未命中返回 400',
+    selMiss.status === 400 && selMiss.data?.error?.includes('未匹配'),
+    `HTTP ${selMiss.status} ${selMiss.data?.error || ''}`
+  )
+
+  // ---- clip：手动裁剪区域 ----
+  const clip = await post('/api/screenshot', {
+    url: FIXTURE_URL,
+    clip: { x: 0, y: 120, width: 1920, height: 240 },
+  })
+  if (!clip.data?.success) {
+    check('clip 截图成功', false, clip.data?.error || '')
+  } else {
+    check('clip 截图成功', true)
+    const raw = await loadRaw(clip.data.screenshot)
+    check('clip 图片尺寸为 1920x240', raw.width === 1920 && raw.height === 240, `实际 ${raw.width}x${raw.height}`)
+    const top = pixelAt(raw, 10, 0)
+    check('clip 顶部(y=120)对应 band #2', colorsClose(top, bandColorAt(120)), formatColor(top, bandColorAt(120)))
+    const bottom = pixelAt(raw, 10, 239)
+    check('clip 底部(y=359)对应 band #5', colorsClose(bottom, bandColorAt(359)), formatColor(bottom, bandColorAt(359)))
+  }
+
+  const clipBad = await post('/api/screenshot', { url: FIXTURE_URL, clip: { x: 0, y: 0, width: 0, height: 10 } })
+  check('clip 宽高为 0 返回 400', clipBad.status === 400, `HTTP ${clipBad.status} ${clipBad.data?.error || ''}`)
+
+  // ---- format：输出格式 ----
+  const jpeg = await post('/api/screenshot', { url: FIXTURE_URL, singleShot: true, format: 'jpeg', quality: 50 })
+  if (!jpeg.data?.success) {
+    check('format=jpeg 截图成功', false, jpeg.data?.error || '')
+  } else {
+    check('format=jpeg 截图成功', true)
+    check('响应 format=jpeg', jpeg.data.format === 'jpeg', `实际 ${jpeg.data.format}`)
+    check('响应 contentType=image/jpeg', jpeg.data.contentType === 'image/jpeg', `实际 ${jpeg.data.contentType}`)
+    const buf = Buffer.from(jpeg.data.screenshot, 'base64')
+    check('JPEG 魔术字节 FF D8 FF', buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff, `首字节 ${buf[0]},${buf[1]},${buf[2]}`)
+  }
+
+  const webp = await post('/api/screenshot', { url: FIXTURE_URL, singleShot: true, format: 'webp' })
+  if (!webp.data?.success) {
+    check('format=webp 截图成功', false, webp.data?.error || '')
+  } else {
+    check('format=webp 截图成功', true)
+    check('响应 format=webp', webp.data.format === 'webp', `实际 ${webp.data.format}`)
+    const buf = Buffer.from(webp.data.screenshot, 'base64')
+    const head = buf.subarray(0, 4).toString('ascii')
+    check('WEBP 魔术字节 RIFF', head === 'RIFF', `首 4 字节 ${head}`)
+  }
+
+  const badFmt = await post('/api/screenshot', { url: FIXTURE_URL, singleShot: true, format: 'gif' })
+  check('非法 format 返回 400', badFmt.status === 400, `HTTP ${badFmt.status} ${badFmt.data?.error || ''}`)
+}
+
 async function testRateLimit() {
   section('限流（放在最后，会消耗掉本机额度）')
 
@@ -460,6 +529,7 @@ async function main() {
     const fixtureOk = await testFixtureBasics()
     if (fixtureOk) {
       await testSingleShot()
+      await testPreciseShot()
       const segments = await testFixtureBatch()
       await testFixtureFullPage()
       await testMerge(segments)

@@ -5,10 +5,13 @@ LinkSnapper 是一个网页截图工具，针对动态加载站点、单页应�
 ## 功能特点
 
 - 🌐 **多类型网站适配**：自动识别 `dynamic` / `spa` / `static` 三类站点并采用不同的加载等待策略
-- 📸 **三种截图模式**
+- 📸 **多种截图模式**
   - 普通截图：截取当前视口
   - 分段截图：按视口高度逐段截取，单次请求可连续截多段，也能一键截到底
   - 整页截图：一次性截取完整页面
+  - 元素截图：用 CSS `selector` 只截某个元素（整元素，可超出视口）
+  - 区域截图：用 `clip` 手动裁剪页面任意矩形区域
+- 🎨 **输出格式可选**：支持 `png` / `jpeg` / `webp`，jpeg / webp 可设 `quality`，统一先截 PNG 再转码保证稳定
 - ⚡ **浏览器实例复用**：Chromium 进程常驻并空闲回收，省掉每次请求 0.5～1.5 秒的冷启动
 - 🔗 **长图拼接**：把已截取的多段画面纵向合并为一张长图（服务端用 sharp 处理）
 - 🛡️ **两层 SSRF 防护**：既校验 URL 字面量，也在浏览器发出请求的那一刻逐个校验，能挡住重定向与子资源探测
@@ -127,9 +130,18 @@ npm run bench         # 分段截图性能对照（需服务已在跑）
   "singleShot": false,    // true = 只截当前视口
   "fullPage": false,      // true = 整页截图
   "offset": 0,            // 分段截图时本段的纵坐标起点
-  "maxSegments": 6        // 分段模式下单次最多返回几段（1～12），默认 6
+  "maxSegments": 6,       // 分段模式下单次最多返回几段（1～12），默认 6
+  "selector": null,       // CSS 选择器：只截匹配到的第一个元素（整元素，可超出视口）；优先级最高
+  "clip": null,           // 手动裁剪区域 {x,y,width,height}（页面坐标系，CSS 像素）；优先级高于 fullPage/singleShot
+  "format": "png",        // 输出格式：png / jpeg / webp，默认 png
+  "quality": 80           // jpeg / webp 质量 1～100，默认 80（png 忽略）
 }
 ```
+
+参数优先级：`selector` > `clip` > `fullPage` > `singleShot` > 分段。
+`selector` 与 `clip` 命中后只返回单张图片（不走分段/拼接），且同样受 SSRF 两层防护约束。
+`format` 对整页 / 视口 / 元素 / 区域截图均生效；分段模式为兼容 `/api/merge` 拼接，恒返回 PNG。
+响应会额外返回 `format` 与 `contentType` 字段，方便调用方正确解码。
 
 响应：
 
