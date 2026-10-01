@@ -9,6 +9,7 @@ import {
 } from '@/utils/url-guard'
 import { BoundedSemaphore, TokenBucketLimiter, getClientKey, QueueFullError, QueueTimeoutError } from '@/utils/rate-limit'
 import { HttpError, readJsonBody } from '@/utils/http-error'
+import { isAuthorized } from '@/utils/auth'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
@@ -460,23 +461,11 @@ async function captureWithRetry(payload: ScreenshotPayload): Promise<CaptureOutc
   throw lastError
 }
 
-function assertAuthorized(request: Request): void {
-  const expected = process.env.SCREENSHOT_API_TOKEN
-  if (!expected) return
-
-  const header = request.headers.get('authorization') || ''
-  const provided = header.toLowerCase().startsWith('bearer ')
-    ? header.slice(7).trim()
-    : request.headers.get('x-api-token') || ''
-
-  if (provided !== expected) {
-    throw new HttpError(401, '缺少或错误的访问令牌')
-  }
-}
-
 export async function POST(request: Request) {
   try {
-    assertAuthorized(request)
+    if (!isAuthorized(request)) {
+      throw new HttpError(401, '缺少或错误的访问令牌')
+    }
 
     const clientKey = getClientKey(request)
     const quota = ipLimiter.take(clientKey)
