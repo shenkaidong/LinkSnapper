@@ -18,13 +18,47 @@ import { spawn } from 'child_process'
 // 与 scripts/install-chrome.mjs / puppeteer-core 锁定的一致；用于出错提示。
 const EXPECTED_CHROME_VERSION = '121.0.6167.85'
 
+const ENV_KEYS = ['CHROME_PATH', 'PUPPETEER_EXECUTABLE_PATH', 'CHROME_BIN'] as const
+
 /** 显式环境变量里能指向 Chrome 的几个键 */
 function envChromePath(): string | null {
-  for (const key of ['CHROME_PATH', 'PUPPETEER_EXECUTABLE_PATH', 'CHROME_BIN']) {
+  for (const key of ENV_KEYS) {
     const value = process.env[key]
     if (value && existsSync(value)) return value
   }
   return null
+}
+
+/**
+ * 已设置、但指向的文件并不存在的环境变量。
+ *
+ * 这些是「显式配置写错了」。以前的做法是静默忽略并回退到系统 Chrome，
+ * 后果很隐蔽：比如运维想通过 CHROME_PATH 钉死版本，路径打错之后服务照常启动，
+ * 只是悄悄换成了系统里另一个版本的浏览器 —— 表现为「偶发截图异常」，
+ * 很难联想到配置错误。现在的策略是照常回退（保证可用性），但必须大声告警。
+ */
+export function getInvalidEnvChromePaths(): string[] {
+  const invalid: string[] = []
+  for (const key of ENV_KEYS) {
+    const value = process.env[key]
+    if (value && !existsSync(value)) invalid.push(`${key}=${value}`)
+  }
+  return invalid
+}
+
+let warnedInvalidEnv = false
+
+/** 回退前告警一次。返回当前仍然无效的配置项 */
+function warnInvalidEnvOnce(): string[] {
+  const invalid = getInvalidEnvChromePaths()
+  if (invalid.length && !warnedInvalidEnv) {
+    warnedInvalidEnv = true
+    console.warn(
+      `[chrome] 以下环境变量已设置但指向的文件不存在，已忽略并回退到其他候选路径：` +
+        `${invalid.join(', ')}。若这是笔误，实际使用的可能是另一个版本的浏览器。`
+    )
+  }
+  return invalid
 }
 
 /** 读 install-chrome.mjs 写出的标记文件 */
@@ -90,6 +124,9 @@ export default async function getChromePath(): Promise<string> {
   const fromEnv = envChromePath()
   if (fromEnv) return fromEnv
 
+  // 显式配置存在但不可用：照常回退，但必须告警（见 warnInvalidEnvOnce 的说明）
+  warnInvalidEnvOnce()
+
   // 2) install-chrome.mjs 的标记文件
   const fromMarker = markerChromePath()
   if (fromMarker) return fromMarker
@@ -126,6 +163,8 @@ export interface ChromeStatus {
   expectedVersion: string
   /** 实际可执行文件的版本（探测失败时 null）；与 expectedVersion 不完全一致不一定致命 */
   actualVersion: string | null
+  /** 已设置但文件不存在的环境变量（如 CHROME_PATH 写错），用于暴露「配置被静默忽略」 */
+  invalidEnvPaths: string[]
   /** 不可用时的人类可读原因 */
   error: string | null
 }
@@ -158,6 +197,7 @@ export async function getChromeStatus(): Promise<ChromeStatus> {
       path: null,
       expectedVersion: EXPECTED_CHROME_VERSION,
       actualVersion: null,
+      invalidEnvPaths: getInvalidEnvChromePaths(),
       error: error instanceof Error ? error.message : String(error),
     }
   }
@@ -168,6 +208,7 @@ export async function getChromeStatus(): Promise<ChromeStatus> {
     path,
     expectedVersion: EXPECTED_CHROME_VERSION,
     actualVersion,
+    invalidEnvPaths: getInvalidEnvChromePaths(),
     error: null,
   }
 }

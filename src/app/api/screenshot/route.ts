@@ -17,6 +17,7 @@ import {
   SAFE_INTERNAL_PROTOCOLS,
 } from '@/utils/url-guard'
 import { BoundedSemaphore, TokenBucketLimiter, getClientKey, QueueFullError, QueueTimeoutError } from '@/utils/rate-limit'
+import { endRequest, tryBeginRequest } from '@/utils/lifecycle'
 import { createRateLimitBackend } from '@/utils/rate-limit-store'
 import { HttpError, readJsonBody } from '@/utils/http-error'
 import { isAuthorized } from '@/utils/auth'
@@ -572,6 +573,13 @@ export async function POST(request: Request) {
     // 并发闸门：每个截图任务都要占一个 Chromium。队列满 / 等待超时抛出的
     // QueueFullError / QueueTimeoutError 会被外层的 toHttpError 翻译成 503，
     // 避免瞬间大量请求把内存打满（在内存受限的容器里尤其关键）。
+    // 停机排空阶段直接拒绝新请求。这里必须「拒绝」而不是「照常排队」：
+    // 排空有超时上限，此时进来的请求大概率会在半途被掐断，
+    // 客户端拿到连接重置，比立刻收到 503 后重试其他实例更糟。
+    if (!tryBeginRequest()) {
+      throw new HttpError(503, '实例正在停机排空，不再接收新的截图任务')
+    }
+
     const release = await captureSemaphore.acquire()
     try {
       const result = await captureWithRetry(payload)
@@ -598,6 +606,7 @@ export async function POST(request: Request) {
       )
     } finally {
       release()
+      endRequest()
     }
   } catch (error) {
     const httpError = toHttpError(error)

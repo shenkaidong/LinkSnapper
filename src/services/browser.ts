@@ -148,7 +148,6 @@ async function acquireBrowser(): Promise<Browser> {
  * 业务代码不必关心复用与清理细节。
  */
 export async function withPage<T>(handler: (page: Page, browser: Browser) => Promise<T>): Promise<T> {
-  installShutdownHooks()
   const browser = await acquireBrowser()
 
   activeUsers++
@@ -181,20 +180,14 @@ export async function closeSharedBrowser(): Promise<void> {
   await browser.close().catch(() => {})
 }
 
-// 进程退出时清理，避免留下孤儿 Chromium 进程
-let hooksInstalled = false
-export function installShutdownHooks(): void {
-  if (hooksInstalled) return
-  hooksInstalled = true
-
-  const cleanup = () => {
-    void closeSharedBrowser()
-  }
-
-  process.once('SIGTERM', cleanup)
-  process.once('SIGINT', cleanup)
-  process.once('beforeExit', cleanup)
-}
+/**
+ * 进程退出时的清理统一由 `@/utils/lifecycle` 负责（`onShutdown(closeSharedBrowser)`）。
+ *
+ * 这里不再自己监听信号：之前的实现注册了 SIGTERM/SIGINT 但只是关浏览器、从不退出进程，
+ * 而 Node 中「注册信号监听」会覆盖默认的终止行为 —— 结果就是容器停止时进程挂住不退出，
+ * 只能等 grace period 后被 SIGKILL。那比什么都不做更糟：看起来做了优雅退出，
+ * 实际上在途请求照样全丢，还多卡了十几秒。
+ */
 
 /** 供 /api/health 之类的观测接口使用 */
 export function getBrowserStatus(): { connected: boolean; activeUsers: number; idleShutdownMs: number } {
