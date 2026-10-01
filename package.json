@@ -8,7 +8,9 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "smoke": "node scripts/smoke-test.mjs"
+    "test:unit": "node --experimental-transform-types --test tests/*.test.ts",
+    "smoke": "node scripts/smoke-test.mjs",
+    "test": "npm run typecheck && npm run test:unit"
   },
   "dependencies": {
     "autoprefixer": "^10.4.16",

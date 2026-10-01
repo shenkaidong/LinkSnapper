@@ -62,8 +62,10 @@ USER pptruser
 EXPOSE 3000
 
 # 健康检查
+# 走 /api/health 而不是首页：这个接口只报进程自身状态，不会产生任何副作用，
+# 也不会因为渲染页面而额外拉起 Chromium。
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD wget -qO- http://127.0.0.1:3000/ > /dev/null || exit 1
+    CMD wget -qO- http://127.0.0.1:3000/api/health > /dev/null || exit 1
 
 # 用 tini 作为 PID 1 启动，避免 Chromium 僵尸进程堆积
 ENTRYPOINT ["/sbin/tini", "--"]

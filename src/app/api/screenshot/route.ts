@@ -1,17 +1,45 @@
-import puppeteer, { Browser, Page } from 'puppeteer-core'
-import getChromePath from '@/utils/chrome'
-import { assertSafeUrl } from '@/utils/url-guard'
+import { Page } from 'puppeteer-core'
+import { withPage } from '@/services/browser'
+import {
+  assertSafeUrl,
+  isBlockedHostname,
+  isHostnameResolvingToPrivate,
+  isPrivateNetworkAllowed,
+  SAFE_INTERNAL_PROTOCOLS,
+} from '@/utils/url-guard'
+import { BoundedSemaphore, TokenBucketLimiter, getClientKey, QueueFullError, QueueTimeoutError } from '@/utils/rate-limit'
+import { HttpError, readJsonBody } from '@/utils/http-error'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
-const MAX_RETRIES = 3
-const RETRY_DELAY_MS = 1000
-const NAV_TIMEOUT_MS = 30000
-const PRELOAD_MAX_MS = 15000
-const SETTLE_MAX_MS = 6000
+const MAX_RETRIES = Number(process.env.MAX_RETRIES) || 2
+const RETRY_DELAY_MS = 1200
+const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS) || 30_000
+const PRELOAD_MAX_MS = 12_000
+const SETTLE_MAX_MS = 6_000
 const MAX_OFFSET = 500_000
-const MAX_CONCURRENT_BROWSERS = 3
+
+// 整页截图与分段截图的高度上限。
+// 一条 1920x30000 的 PNG base64 后约 30MB，再往上就有把进程内存打满的风险。
+const MAX_FULLPAGE_HEIGHT = Number(process.env.MAX_FULLPAGE_HEIGHT) || 30_000
+
+// 单次请求最多返回几段。批量化是为了省掉「每次都要重新加载页面」，
+// 但一次返回太多段会让响应体膨胀、前端渲染卡顿，这里取一个折中值。
+const DEFAULT_MAX_SEGMENTS = 6
+const MAX_SEGMENTS_PER_REQUEST = 12
+
+const MAX_CONCURRENT_CAPTURES = Number(process.env.MAX_CONCURRENT_CAPTURES) || 3
+const MAX_QUEUE_LENGTH = Number(process.env.MAX_QUEUE_LENGTH) || 24
+const QUEUE_TIMEOUT_MS = Number(process.env.QUEUE_TIMEOUT_MS) || 45_000
+
+// 每 IP 的令牌桶：容量 6 次突发，之后按 0.2 次/秒（即 12 次/分钟）补充。
+// 单次截图动辄数秒，这个额度对正常使用者绰绰有余，对脚本刷接口则很快见底。
+const RATE_LIMIT_CAPACITY = Number(process.env.RATE_LIMIT_CAPACITY) || 6
+const RATE_LIMIT_REFILL_PER_SEC = Number(process.env.RATE_LIMIT_REFILL_PER_SEC) || 0.2
+
+const captureSemaphore = new BoundedSemaphore(MAX_CONCURRENT_CAPTURES, MAX_QUEUE_LENGTH, QUEUE_TIMEOUT_MS)
+const ipLimiter = new TokenBucketLimiter(RATE_LIMIT_CAPACITY, RATE_LIMIT_REFILL_PER_SEC)
 
 type WebsiteType = 'dynamic' | 'static' | 'spa'
 
@@ -20,39 +48,30 @@ interface ScreenshotPayload {
   fullPage?: boolean
   singleShot?: boolean
   offset?: number
+  maxSegments?: number
 }
 
-interface ScreenshotResult {
-  screenshot: string
+interface CapturedSegment {
+  offset: number
+  height: number
+  image: string
+}
+
+interface CaptureOutcome {
+  segments: CapturedSegment[]
   isEnd: boolean
   nextOffset: number
+  pageHeight: number
 }
+
+const NO_STORE_HEADERS = { 'Cache-Control': 'no-store, max-age=0' }
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
 
 /**
- * 浏览器实例很吃内存，这里做一层进程内并发闸门，防止并发请求把机器打爆。
- * 注意这是进程内的，多实例部署时每个实例各限各的。
+ * 已知的动态加载站点，走更长的等待策略。
+ * 这里按主机名后缀匹配，不能用 includes —— 否则 notbilibili.com 也会命中。
  */
-let activeBrowsers = 0
-const waitingForSlot: Array<() => void> = []
-
-async function acquireBrowserSlot(): Promise<() => void> {
-  while (activeBrowsers >= MAX_CONCURRENT_BROWSERS) {
-    await new Promise<void>(resolve => waitingForSlot.push(resolve))
-  }
-  activeBrowsers++
-
-  let released = false
-  return () => {
-    if (released) return
-    released = true
-    activeBrowsers--
-    waitingForSlot.shift()?.()
-  }
-}
-
-/** 已知的动态加载站点，走更长的等待策略 */
 const KNOWN_DYNAMIC_SITES = ['bilibili.com', 'zhihu.com', 'weibo.com', 'douyin.com', 'xiaohongshu.com']
 
 const LOADING_SELECTORS = [
@@ -71,12 +90,20 @@ function normalizeOffset(value: unknown): number {
   return Math.min(Math.trunc(parsed), MAX_OFFSET)
 }
 
+function normalizeMaxSegments(value: unknown): number {
+  const parsed = typeof value === 'number' ? value : Number.parseInt(String(value ?? ''), 10)
+  if (!Number.isFinite(parsed) || parsed <= 0) return 1
+  return Math.min(Math.trunc(parsed), MAX_SEGMENTS_PER_REQUEST)
+}
+
 /**
  * 判断一次失败是否值得重试。
- * 域名不存在、地址非法、被浏览器直接拒绝这类错误重试多少次结果都一样，
+ * 域名不存在、地址非法、被护栏拦下这类错误重试多少次结果都一样；
  * 而超时、连接被重置这类则往往是瞬时的，值得重试。
  */
 function isRetryable(error: unknown): boolean {
+  if (error instanceof HttpError) return error.status >= 500
+
   const message = error instanceof Error ? error.message : String(error)
   const permanentPatterns = [
     'ERR_NAME_NOT_RESOLVED',
@@ -89,8 +116,110 @@ function isRetryable(error: unknown): boolean {
   return !permanentPatterns.some(pattern => message.includes(pattern))
 }
 
-async function detectWebsiteType(page: Page, url: string): Promise<WebsiteType> {
-  if (KNOWN_DYNAMIC_SITES.some(site => url.includes(site))) {
+/** 把浏览器抛出的底层错误翻译成对使用者有意义的状态码与文案 */
+function toHttpError(error: unknown): HttpError {
+  if (error instanceof HttpError) return error
+
+  const message = error instanceof Error ? error.message : String(error)
+
+  if (error instanceof QueueFullError) return new HttpError(503, error.message)
+  if (error instanceof QueueTimeoutError) return new HttpError(503, error.message)
+
+  if (/Navigation timeout|Timeout|timeout/i.test(message)) {
+    return new HttpError(504, '目标页面加载超时，请稍后重试或换一个地址')
+  }
+  if (message.includes('ERR_NAME_NOT_RESOLVED')) {
+    return new HttpError(502, '无法解析该域名，请检查地址是否正确')
+  }
+  if (message.includes('ERR_CONNECTION_REFUSED')) {
+    return new HttpError(502, '目标服务器拒绝连接')
+  }
+  if (message.includes('ERR_CONNECTION_RESET') || message.includes('ERR_CONNECTION_CLOSED')) {
+    return new HttpError(502, '与目标服务器的连接被中断')
+  }
+  if (message.includes('ERR_ABORTED')) {
+    return new HttpError(502, '页面加载被中断，可能是目标站点限制了访问')
+  }
+  if (message.includes('ERR_CERT') || message.includes('ERR_SSL')) {
+    return new HttpError(502, '目标站点证书校验失败')
+  }
+  if (message.includes('未找到可用的 Chrome')) {
+    return new HttpError(500, message)
+  }
+
+  return new HttpError(500, '截图失败，请稍后重试')
+}
+
+// ---------------------------------------------------------------------------
+// 请求拦截：SSRF 的第二道防线
+// ---------------------------------------------------------------------------
+
+interface GuardState {
+  blockedUrl: string | null
+}
+
+/**
+ * 只校验用户填进来的那个 URL 是拦不住 SSRF 的：
+ *   - 页面可以 302 跳到内网地址，校验发生在跳转之前；
+ *   - 页面里的 img / script / fetch 也能直接把请求打到内网；
+ *   - 域名本身合法，但 DNS 记录指向 127.0.0.1（DNS 重绑定）。
+ *
+ * 所以必须在浏览器真正发出请求的那一刻逐个校验，这里就是那个关口。
+ */
+async function installRequestGuard(page: Page, state: GuardState): Promise<void> {
+  await page.setRequestInterception(true)
+
+  page.on('request', request => {
+    void (async () => {
+      try {
+        let parsed: URL
+        try {
+          parsed = new URL(request.url())
+        } catch {
+          await request.abort('blockedbyclient')
+          return
+        }
+
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+          // data: / blob: / about: 是页面自身的内部资源，与网络访问无关
+          if (SAFE_INTERNAL_PROTOCOLS.has(parsed.protocol)) await request.continue()
+          else await request.abort('blockedbyclient')
+          return
+        }
+
+        if (!isPrivateNetworkAllowed()) {
+          // 1) 字面量拦截：直写内网 IP、localhost、*.internal 之类
+          if (isBlockedHostname(parsed.hostname)) {
+            state.blockedUrl = request.url()
+            await request.abort('blockedbyclient')
+            return
+          }
+
+          // 2) 解析后拦截：域名合法但指向内网
+          if (await isHostnameResolvingToPrivate(parsed.hostname)) {
+            state.blockedUrl = request.url()
+            await request.abort('blockedbyclient')
+            return
+          }
+        }
+
+        await request.continue()
+      } catch {
+        // 无论如何都要让请求有个归宿，否则页面会一直卡住
+        await request.continue().catch(() => {})
+      }
+    })()
+  })
+}
+
+// ---------------------------------------------------------------------------
+// 页面处理
+// ---------------------------------------------------------------------------
+
+async function detectWebsiteType(page: Page, target: URL): Promise<WebsiteType> {
+  const host = target.hostname.toLowerCase()
+
+  if (KNOWN_DYNAMIC_SITES.some(site => host === site || host.endsWith(`.${site}`))) {
     return 'dynamic'
   }
 
@@ -136,7 +265,7 @@ async function waitForDynamicContent(page: Page, maxMs = SETTLE_MAX_MS): Promise
 
 /**
  * 预加载懒加载内容：滚到底再回到顶部，让懒加载 / 无限滚动的区块都渲染出来。
- * 原实现用 while(true)，遇到无限滚动站点会一直转下去，这里加了时间上限。
+ * 用 while(true) 遇到无限滚动站点会一直转下去，所以加了时间上限。
  */
 async function preloadLazyContent(page: Page, maxMs = PRELOAD_MAX_MS): Promise<void> {
   await page
@@ -193,66 +322,40 @@ async function measurePage(page: Page) {
   }))
 }
 
-async function launchBrowser(): Promise<Browser> {
-  const executablePath = await getChromePath()
-
-  return puppeteer.launch({
-    executablePath,
-    headless: 'new',
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--disable-gpu',
-      '--hide-scrollbars',
-      '--window-size=1920,1080',
-      '--disable-background-timer-throttling',
-      '--disable-backgrounding-occluded-windows',
-      '--disable-breakpad',
-      '--disable-component-extensions-with-background-pages',
-      '--disable-extensions',
-      '--disable-ipc-flooding-protection',
-      '--disable-renderer-backgrounding',
-      // 只允许出现一次 --disable-features，重复出现时后一个的值会覆盖前一个。
-      // 同时刻意移除了 --disable-web-security：它会关闭同源策略，
-      // 配合「任意 URL 都能访问」的截图能力，等于把 SSRF 放大。
-      '--disable-features=TranslateUI',
-      '--enable-features=NetworkService,NetworkServiceInProcess',
-      '--force-color-profile=srgb',
-      '--metrics-recording-only',
-      '--mute-audio',
-      '--no-first-run',
-      '--no-default-browser-check',
-      '--no-pings',
-      '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    ],
-    defaultViewport: {
-      width: 1920,
-      height: 1080,
-      deviceScaleFactor: 1,
+async function takeClip(page: Page, offset: number, width: number, height: number): Promise<string> {
+  const image = await page.screenshot({
+    type: 'png',
+    optimizeForSpeed: true,
+    encoding: 'base64',
+    captureBeyondViewport: true,
+    clip: {
+      x: 0,
+      y: offset,
+      width: Math.max(1, width),
+      height: Math.max(1, height),
     },
-    protocolTimeout: NAV_TIMEOUT_MS,
   })
+
+  return image as string
 }
 
-async function captureOnce(payload: ScreenshotPayload, target: URL): Promise<ScreenshotResult> {
-  const release = await acquireBrowserSlot()
-  let browser: Browser | null = null
+async function captureOnce(payload: ScreenshotPayload): Promise<CaptureOutcome> {
+  const target = new URL(payload.url)
+  const guard: GuardState = { blockedUrl: null }
 
-  try {
-    browser = await launchBrowser()
-    const page = await browser.newPage()
+  return withPage(async page => {
+    await installRequestGuard(page, guard)
 
-    await page.setDefaultNavigationTimeout(NAV_TIMEOUT_MS)
-    await page.setDefaultTimeout(NAV_TIMEOUT_MS)
-    await page.setExtraHTTPHeaders({
-      'Accept-Language': 'zh-CN,zh;q=0.9',
-    })
+    try {
+      await page.goto(target.toString(), { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS })
+    } catch (error) {
+      if (guard.blockedUrl) {
+        throw new HttpError(403, '目标地址（或其跳转、子资源）指向内网，已拦截')
+      }
+      throw error
+    }
 
-    await page.goto(target.toString(), { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT_MS })
-
-    const websiteType = await detectWebsiteType(page, target.toString())
+    const websiteType = await detectWebsiteType(page, target)
     await settlePage(page, websiteType)
 
     // ---- 整页截图 ----
@@ -262,32 +365,44 @@ async function captureOnce(payload: ScreenshotPayload, target: URL): Promise<Scr
         await waitForDynamicContent(page)
       }
 
-      const screenshot = await page.screenshot({
+      const { pageHeight } = await measurePage(page)
+      if (pageHeight > MAX_FULLPAGE_HEIGHT) {
+        throw new HttpError(
+          413,
+          `页面高度 ${pageHeight}px 超出整页截图上限 ${MAX_FULLPAGE_HEIGHT}px，请改用分段截图`
+        )
+      }
+
+      // 这里走 puppeteer 自己的 fullPage 路径（内部同样按内容尺寸裁剪），
+      // 比自己算 clip 更稳，也不受页面滚动位置影响。
+      const image = (await page.screenshot({
         fullPage: true,
         type: 'png',
         optimizeForSpeed: true,
         encoding: 'base64',
-      })
+      })) as string
 
-      return { screenshot: screenshot as string, isEnd: true, nextOffset: 0 }
+      return { segments: [{ offset: 0, height: pageHeight, image }], isEnd: true, nextOffset: 0, pageHeight }
     }
 
-    // ---- 普通单次截图 ----
+    // ---- 普通单次截图（当前视口）----
     if (payload.singleShot) {
-      const screenshot = await page.screenshot({
+      const image = (await page.screenshot({
         fullPage: false,
         type: 'png',
         optimizeForSpeed: true,
         encoding: 'base64',
-      })
+        captureBeyondViewport: false,
+      })) as string
 
-      return { screenshot: screenshot as string, isEnd: true, nextOffset: 0 }
+      return { segments: [{ offset: 0, height: 0, image }], isEnd: true, nextOffset: 0, pageHeight: 0 }
     }
 
     // ---- 分段截图 ----
-    // 滚动位置由前端通过 offset 传入，服务端不再保存任何会话状态，
+    // 滚动位置由前端通过 offset 传入，服务端不保存任何会话状态，
     // 这样多实例部署、重启、并发请求都不会互相污染。
     const offset = normalizeOffset(payload.offset)
+    const maxSegments = normalizeMaxSegments(payload.maxSegments)
 
     if (websiteType !== 'static') {
       await preloadLazyContent(page)
@@ -296,49 +411,45 @@ async function captureOnce(payload: ScreenshotPayload, target: URL): Promise<Scr
     const { pageHeight, viewportWidth, viewportHeight } = await measurePage(page)
 
     if (offset >= pageHeight) {
-      return { screenshot: '', isEnd: true, nextOffset: offset }
+      return { segments: [], isEnd: true, nextOffset: offset, pageHeight }
     }
 
-    // 最后一段按剩余高度裁剪，避免 clip 越出页面边界导致截图报错
-    const height = Math.max(1, Math.min(viewportHeight, pageHeight - offset))
+    // 裁剪坐标以页面左上角为原点，先把滚动位置归零再截，
+    // 避免页面残留的滚动位置影响 clip 的参考系。
+    await page.evaluate(() => window.scrollTo(0, 0)).catch(() => {})
 
-    const screenshot = await page.screenshot({
-      fullPage: false,
-      type: 'png',
-      optimizeForSpeed: true,
-      encoding: 'base64',
-      clip: {
-        x: 0,
-        y: offset,
-        width: Math.max(1, viewportWidth),
-        height,
-      },
-    })
+    // 一次请求内连续截多段：页面只加载一次、预加载滚动只跑一次，
+    // 省掉的是 N 次 Chromium 冷启动 + N 次完整页面加载。
+    const segments: CapturedSegment[] = []
+    let cursor = offset
 
-    const nextOffset = offset + height
+    while (segments.length < maxSegments && cursor < pageHeight) {
+      // 最后一段按剩余高度裁剪，避免 clip 越出页面边界导致截图报错
+      const height = Math.max(1, Math.min(viewportHeight, pageHeight - cursor))
+      const image = await takeClip(page, cursor, viewportWidth, height)
+      segments.push({ offset: cursor, height, image })
+      cursor += height
+    }
+
     return {
-      screenshot: screenshot as string,
-      isEnd: nextOffset >= pageHeight,
-      nextOffset,
+      segments,
+      isEnd: cursor >= pageHeight,
+      nextOffset: cursor,
+      pageHeight,
     }
-  } finally {
-    if (browser) {
-      await browser.close().catch(() => {})
-    }
-    release()
-  }
+  })
 }
 
 /** 统一重试入口：保证每次重试都带上完整参数（原实现在递归时漏传了 singleShot） */
-async function captureWithRetry(payload: ScreenshotPayload, target: URL): Promise<ScreenshotResult> {
+async function captureWithRetry(payload: ScreenshotPayload): Promise<CaptureOutcome> {
   let lastError: unknown
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      return await captureOnce(payload, target)
+      return await captureOnce(payload)
     } catch (error) {
       lastError = error
-      // 域名解析失败、无效地址这类属于确定性错误，重试只会白白拖长响应时间
+      // 确定性错误重试只会白白拖长响应时间
       if (!isRetryable(error) || attempt === MAX_RETRIES) break
 
       console.warn(`截图失败，正在重试 (${attempt + 1}/${MAX_RETRIES})：`, error)
@@ -346,38 +457,82 @@ async function captureWithRetry(payload: ScreenshotPayload, target: URL): Promis
     }
   }
 
-  throw lastError instanceof Error ? lastError : new Error('截图失败，请稍后重试')
+  throw lastError
+}
+
+function assertAuthorized(request: Request): void {
+  const expected = process.env.SCREENSHOT_API_TOKEN
+  if (!expected) return
+
+  const header = request.headers.get('authorization') || ''
+  const provided = header.toLowerCase().startsWith('bearer ')
+    ? header.slice(7).trim()
+    : request.headers.get('x-api-token') || ''
+
+  if (provided !== expected) {
+    throw new HttpError(401, '缺少或错误的访问令牌')
+  }
 }
 
 export async function POST(request: Request) {
-  let body: ScreenshotPayload
-
   try {
-    body = await request.json()
-  } catch {
-    return Response.json({ success: false, error: '请求体不是合法的 JSON' }, { status: 400 })
-  }
+    assertAuthorized(request)
 
-  try {
-    const target = assertSafeUrl(body?.url)
+    const clientKey = getClientKey(request)
+    const quota = ipLimiter.take(clientKey)
+    if (!quota.allowed) {
+      return Response.json(
+        { success: false, error: '请求过于频繁，请稍后再试' },
+        { status: 429, headers: { ...NO_STORE_HEADERS, 'Retry-After': String(quota.retryAfterSec) } }
+      )
+    }
+
+    const body = (await readJsonBody(request)) as Partial<ScreenshotPayload>
+
+    let target: URL
+    try {
+      target = assertSafeUrl(body?.url)
+    } catch (error) {
+      throw new HttpError(400, error instanceof Error ? error.message : 'url 参数不合法')
+    }
+
+    // 挂起的排队请求数也一并回传，方便运维侧观察压力
     const payload: ScreenshotPayload = {
       url: target.toString(),
       fullPage: Boolean(body.fullPage),
       singleShot: Boolean(body.singleShot),
       offset: normalizeOffset(body.offset),
+      maxSegments: normalizeMaxSegments(body.maxSegments ?? (body.singleShot || body.fullPage ? 1 : DEFAULT_MAX_SEGMENTS)),
     }
 
-    const result = await captureWithRetry(payload, target)
+    const result = await captureWithRetry(payload)
 
-    return Response.json({
-      success: true,
-      screenshot: result.screenshot,
-      isEnd: result.isEnd,
-      nextOffset: result.nextOffset,
-    })
+    return Response.json(
+      {
+        success: true,
+        // segments 是标准字段；screenshot 保留为第一段的别名，兼容旧调用方
+        segments: result.segments.map(segment => ({
+          offset: segment.offset,
+          height: segment.height,
+          image: segment.image,
+        })),
+        screenshot: result.segments[0]?.image ?? '',
+        isEnd: result.isEnd,
+        nextOffset: result.nextOffset,
+        pageHeight: result.pageHeight,
+        queue: { active: captureSemaphore.activeCount, waiting: captureSemaphore.waitingCount },
+      },
+      { headers: NO_STORE_HEADERS }
+    )
   } catch (error) {
-    const message = error instanceof Error ? error.message : '截图失败，请稍后重试'
-    console.error('Screenshot error:', error)
-    return Response.json({ success: false, error: message }, { status: 400 })
+    const httpError = toHttpError(error)
+    if (httpError.status >= 500) {
+      console.error('Screenshot error:', error)
+    }
+
+    return Response.json(
+      { success: false, error: httpError.message },
+      { status: httpError.status, headers: NO_STORE_HEADERS }
+    )
   }
 }

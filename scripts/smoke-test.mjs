@@ -3,15 +3,52 @@
  * LinkSnapper 冒烟测试。
  *
  * 用法：
- *   1. 先启动服务（npm run dev，或 npm run build && npm start）
- *   2. node scripts/smoke-test.mjs
- *      或 BASE_URL=http://localhost:3000 node scripts/smoke-test.mjs
+ *   npm run smoke                      # 需要服务已在 BASE_URL 上跑着
+ *   BASE_URL=http://127.0.0.1:3100 npm run smoke
+ *   SMOKE_EXTERNAL=1 npm run smoke     # 额外跑一组真实外网站点用例（需要联网）
  *
- * 需要环境中有可用的 Chrome / Chromium。退出码非 0 表示存在断言失败。
+ * 设计要点：
+ *
+ * 1. **自带基准页**。分段截图的核心断言是「每段恰好落在页面的哪个位置」，
+ *    只有在一个高度、内容都可预测的页面上才验得准。所以用仓库自带的
+ *    /test-fixture.html —— 3000px 高、50 条 60px 纯色横条。
+ *    服务端需要设 ALLOWED_INTERNAL_HOSTS=127.0.0.1 才能访问它。
+ *
+ * 2. **像素级验证**。不满足于「段高加起来等于总高」，而是直接读出每段
+ *    首行 / 末行的颜色，反推它真实的 y 区间，从根上排除重叠与跳空。
+ *
+ * 3. **默认不依赖外网**。外网用例放在 SMOKE_EXTERNAL 后面，CI 里可以不开，
+ *    避免第三方站点抖动导致误报。
+ *
+ * 退出码非 0 表示存在断言失败。
  */
 
+import sharp from 'sharp'
+
 const BASE_URL = (process.env.BASE_URL || 'http://127.0.0.1:3000').replace(/\/$/, '')
+const RUN_EXTERNAL = process.env.SMOKE_EXTERNAL === '1'
+
 const PNG_MAGIC = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
+// 与 public/test-fixture.html 保持一致
+const BAND_HEIGHT = 60
+const BAND_COUNT = 50
+const FIXTURE_HEIGHT = BAND_HEIGHT * BAND_COUNT // 3000
+const BANDS = [
+  [0xdc, 0x26, 0x26],
+  [0xea, 0x58, 0x0c],
+  [0xca, 0x8a, 0x04],
+  [0x16, 0xa3, 0x4a],
+  [0x08, 0x91, 0xb2],
+  [0x25, 0x63, 0xeb],
+  [0x7c, 0x3a, 0xed],
+  [0xdb, 0x27, 0x77],
+  [0x78, 0x35, 0x0f],
+  [0x33, 0x41, 0x55],
+]
+const COLOR_TOLERANCE = 16
+
+const FIXTURE_URL = `${BASE_URL}/test-fixture.html`
 
 let passed = 0
 let failed = 0
@@ -26,6 +63,10 @@ function check(label, condition, detail = '') {
   }
 }
 
+function section(title) {
+  console.log(`\n${title}`)
+}
+
 async function post(path, payload, timeoutMs = 180000) {
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), timeoutMs)
@@ -33,136 +74,409 @@ async function post(path, payload, timeoutMs = 180000) {
     const response = await fetch(`${BASE_URL}${path}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
+      body: typeof payload === 'string' ? payload : JSON.stringify(payload),
       signal: controller.signal,
     })
-    return await response.json()
+    let data = null
+    try {
+      data = await response.json()
+    } catch {
+      data = null
+    }
+    return { status: response.status, headers: response.headers, data }
+  } catch (error) {
+    return { status: 0, headers: new Headers(), data: null, networkError: error.message }
   } finally {
     clearTimeout(timer)
   }
 }
 
+/** 把 base64 PNG 解码成原始像素，方便按下标直接取色 */
+async function loadRaw(base64) {
+  const buffer = Buffer.from(base64, 'base64')
+  const { data, info } = await sharp(buffer).ensureAlpha().raw().toBuffer({ resolveWithObject: true })
+  return { buffer, data, width: info.width, height: info.height, channels: info.channels }
+}
+
+function pixelAt(raw, x, y) {
+  const index = (y * raw.width + x) * raw.channels
+  return [raw.data[index], raw.data[index + 1], raw.data[index + 2]]
+}
+
+function colorsClose(a, b, tolerance = COLOR_TOLERANCE) {
+  return a.every((value, index) => Math.abs(value - b[index]) <= tolerance)
+}
+
+function formatColor(color, expected) {
+  return `实际 rgb(${color.join(',')}) 期望 rgb(${expected.join(',')})`
+}
+
+function bandColorAt(y) {
+  return BANDS[Math.floor(y / BAND_HEIGHT) % BANDS.length]
+}
+
+/** 用首行 / 末行颜色反推分段真实覆盖的 y 区间，据此判断是否与预期一致 */
+async function verifySegmentPixels(raw, segment, label) {
+  const topColor = pixelAt(raw, 10, 0)
+  const expectedTop = bandColorAt(segment.offset)
+  check(`${label} 首行颜色对应 y=${segment.offset}`, colorsClose(topColor, expectedTop), formatColor(topColor, expectedTop))
+
+  const bottomY = segment.height - 1
+  const bottomColor = pixelAt(raw, 10, bottomY)
+  const expectedBottom = bandColorAt(segment.offset + bottomY)
+  check(
+    `${label} 末行颜色对应 y=${segment.offset + bottomY}`,
+    colorsClose(bottomColor, expectedBottom),
+    formatColor(bottomColor, expectedBottom)
+  )
+}
+
+// ---------------------------------------------------------------------------
+
+async function testHealth() {
+  section('健康检查')
+  const response = await fetch(`${BASE_URL}/api/health`).catch(error => ({ ok: false, error }))
+  if (!response.ok) {
+    check('GET /api/health 返回 200', false, String(response.error || response.status))
+    return
+  }
+  const data = await response.json()
+  check('status 为 ok', data.status === 'ok', JSON.stringify(data.guards || {}))
+  check(
+    '已开启内网拦截',
+    data.guards?.privateNetworkBlocked === true,
+    `allowedInternalHosts=${JSON.stringify(data.guards?.allowedInternalHosts)}`
+  )
+}
+
+/**
+ * 安全拦截用例。
+ *
+ * 关键点：断言必须校验「被拒绝的原因」，不能只看状态码。
+ * 否则一条用例可能因为完全无关的理由通过（比如网络不通导致的 502），
+ * 看起来是绿的，实际护栏根本没生效 —— 这比没有测试更危险。
+ */
 async function testSecurity() {
-  console.log('\n安全拦截（SSRF 防护）')
+  section('安全拦截（SSRF 防护）')
+
+  // 注意：这些地址都不能出现在 ALLOWED_INTERNAL_HOSTS 里，否则会被合法放行。
+  // 基准页用的是 127.0.0.1，所以这里刻意改用 127.0.0.2 等其它内网地址，
+  // 以及 10.x 的十进制 / 十六进制写法 —— 它们规范化后是 10.0.0.1，同样不在白名单里。
   const blocked = [
-    'http://127.0.0.1:8080/admin',
-    'http://localhost/x',
-    'http://169.254.169.254/latest/meta-data/',
-    'http://10.0.0.5/',
-    'http://192.168.1.1/',
-    'http://[::1]/',
-    'file:///etc/passwd',
-    'http://user:pass@example.com/',
+    { url: 'http://127.0.0.2:8080/admin', reason: '禁止截图内网' },
+    { url: 'http://localhost/x', reason: '禁止截图内网' },
+    { url: 'http://localhost.localdomain/', reason: '禁止截图内网' },
+    { url: 'http://169.254.169.254/latest/meta-data/', reason: '禁止截图内网' },
+    { url: 'http://10.0.0.5/', reason: '禁止截图内网' },
+    { url: 'http://172.16.0.1/', reason: '禁止截图内网' },
+    { url: 'http://192.168.1.1/', reason: '禁止截图内网' },
+    { url: 'http://100.64.0.1/', reason: '禁止截图内网' },
+    { url: 'http://[::1]/', reason: '禁止截图内网' },
+    { url: 'http://[::ffff:127.0.0.1]/', reason: '禁止截图内网' },
+    { url: 'http://[::ffff:7f00:1]/', reason: '禁止截图内网' },
+    { url: 'http://[64:ff9b::127.0.0.1]/', reason: '禁止截图内网' },
+    { url: 'http://167772161/', reason: '禁止截图内网' }, // 十进制写法 = 10.0.0.1
+    { url: 'http://0x0a000001/', reason: '禁止截图内网' }, // 十六进制写法 = 10.0.0.1
+    { url: 'http://router.local/', reason: '禁止截图内网' },
+    { url: 'http://db.internal/', reason: '禁止截图内网' },
+    { url: 'file:///etc/passwd', reason: '仅支持 http 与 https' },
+    { url: 'javascript:alert(1)', reason: '仅支持 http 与 https' },
+    { url: 'data:text/html,<h1>x</h1>', reason: '仅支持 http 与 https' },
+    { url: 'ftp://example.com/', reason: '仅支持 http 与 https' },
+    { url: 'http://user:pass@example.com/', reason: '不允许携带用户名或密码' },
   ]
 
-  for (const target of blocked) {
-    const data = await post('/api/screenshot', { url: target, singleShot: true })
-    check(`${target} 应被拒绝`, data.success === false, data.error || '竟然放行了')
+  for (const item of blocked) {
+    const { status, data } = await post('/api/screenshot', { url: item.url, singleShot: true })
+    const error = data?.error || ''
+    check(
+      `${item.url} 应因「${item.reason}」被拒`,
+      status === 400 && data?.success === false && error.includes(item.reason),
+      `HTTP ${status} ${error}`
+    )
+  }
+}
+
+/**
+ * 重定向型 SSRF。
+ *
+ * 这是只做 URL 字面量校验时必然漏掉的一类：用户填的地址完全合法（就在白名单里），
+ * 但服务端一访问，对方回一个 302 把它指向云元数据接口。
+ * 护栏必须在浏览器发出「跳转后的那个请求」时把它拦下，而不是只看用户填的那一个 URL。
+ */
+async function testRedirectSsrf() {
+  section('重定向型 SSRF')
+
+  const cases = ['http://169.254.169.254/', 'http://10.0.0.5/', 'http://127.0.0.2/']
+
+  for (const target of cases) {
+    const url = `${BASE_URL}/api/test-redirect?to=${encodeURIComponent(target)}`
+    const { status, data } = await post('/api/screenshot', { url, singleShot: true })
+    const error = data?.error || ''
+
+    check(
+      `302 跳转到 ${target} 应被拦截`,
+      status === 403 && error.includes('内网'),
+      `HTTP ${status} ${error}`
+    )
+  }
+
+  // 反向验证：同一个接口跳到一个正常地址时必须能通过，
+  // 否则上面几条「通过」可能只是因为跳转本身失效了。
+  const okUrl = `${BASE_URL}/api/test-redirect?to=${encodeURIComponent('/test-fixture.html')}`
+  const ok = await post('/api/screenshot', { url: okUrl, singleShot: true })
+  check(
+    '同一跳转接口指向正常地址时应能正常截图',
+    ok.data?.success === true,
+    `HTTP ${ok.status} ${ok.data?.error || ''}`
+  )
+}
+
+async function testNoFalsePositive() {
+  section('误杀检测：正常域名不应被当成内网')
+
+  const candidates = ['https://fda.gov/', 'https://fcanet.example/', 'https://fcbarcelona.com/']
+
+  for (const target of candidates) {
+    const { data } = await post('/api/screenshot', { url: target, singleShot: true })
+    const wronglyBlocked = typeof data?.error === 'string' && data.error.includes('禁止截图内网')
+    check(`${target} 不应被判定为内网地址`, !wronglyBlocked, data?.error || '已放行（后续失败与外网可达性有关）')
   }
 }
 
 async function testValidation() {
-  console.log('\n参数校验')
-  for (const payload of [{}, { url: '' }, { url: 123 }]) {
-    const data = await post('/api/screenshot', payload)
-    check(`${JSON.stringify(payload)} 应报错`, data.success === false, data.error || '未报错')
-  }
-}
+  section('参数校验与请求体限制')
 
-/** 回归用例：早期版本用 /^f[cd]/ 判断 IPv6 私有地址，会误杀 fda.gov 这类正常域名 */
-async function testNoFalsePositive() {
-  console.log('\n误杀检测')
-  for (const target of ['https://fda.gov/', 'https://fcanet.example/']) {
-    const data = await post('/api/screenshot', { url: target, singleShot: true })
-    const wronglyBlocked = typeof data.error === 'string' && data.error.includes('禁止截图内网')
-    check(`${target} 不应被判定为内网地址`, !wronglyBlocked, data.error || '正常放行')
-  }
-}
+  const cases = [
+    {},
+    { url: '' },
+    { url: '   ' },
+    { url: 123 },
+    { url: null },
+    { url: [] },
+  ]
 
-async function testSingleShot() {
-  console.log('\n普通截图')
-  const data = await post('/api/screenshot', { url: 'example.com', singleShot: true })
-  check('请求成功', data.success === true, data.error || '')
-  if (!data.success) return
-
-  const raw = Buffer.from(data.screenshot, 'base64')
-  check('返回有效 PNG', raw.subarray(0, 8).equals(PNG_MAGIC), `${raw.length} 字节`)
-}
-
-async function testSegmented() {
-  console.log('\n分段截图（无状态 offset）')
-  const url = 'https://en.wikipedia.org/wiki/Screenshot'
-  let offset = 0
-  const segments = []
-
-  for (let i = 0; i < 4; i++) {
-    const data = await post('/api/screenshot', { url, offset })
-    if (!data.success) {
-      check(`第 ${i + 1} 段请求成功`, false, data.error)
-      return
-    }
-
-    const raw = data.screenshot ? Buffer.from(data.screenshot, 'base64') : Buffer.alloc(0)
-    segments.push({ offset, nextOffset: data.nextOffset, size: raw.length, isEnd: data.isEnd })
-    check(
-      `第 ${i + 1} 段 offset=${offset} → nextOffset=${data.nextOffset}`,
-      raw.length > 0 && raw.subarray(0, 8).equals(PNG_MAGIC),
-      `${raw.length} 字节, isEnd=${data.isEnd}`
-    )
-
-    if (data.isEnd) break
-    offset = data.nextOffset
+  for (const payload of cases) {
+    const { status, data } = await post('/api/screenshot', payload)
+    check(`${JSON.stringify(payload)} 应返回 400`, status === 400 && data?.success === false, `HTTP ${status} ${data?.error || ''}`)
   }
 
-  // 段与段之间必须首尾相接，既不能重叠也不能跳空
-  const continuous = segments.every(
-    (seg, i) => i === 0 || segments[i - 1].nextOffset === seg.offset
-  )
-  check('分段首尾相接，无重叠/跳空', continuous)
+  const malformed = await post('/api/screenshot', '{not json')
+  check('非法 JSON 应返回 400', malformed.status === 400, `HTTP ${malformed.status} ${malformed.data?.error || ''}`)
+
+  const oversized = await post('/api/screenshot', JSON.stringify({ url: 'example.com', pad: 'x'.repeat(64 * 1024) }))
+  check('超大请求体应返回 413', oversized.status === 413, `HTTP ${oversized.status} ${oversized.data?.error || ''}`)
 }
 
-async function testFullPage() {
-  console.log('\n整页截图')
-  const data = await post('/api/screenshot', { url: 'example.com', fullPage: true })
-  check('请求成功', data.success === true, data.error || '')
-  if (!data.success) return
+async function testFixtureBasics() {
+  section('基准页：分段截图（无状态 offset）')
 
-  const raw = Buffer.from(data.screenshot, 'base64')
-  check('返回有效 PNG', raw.subarray(0, 8).equals(PNG_MAGIC), `${raw.length} 字节`)
+  const first = await post('/api/screenshot', { url: FIXTURE_URL, offset: 0, maxSegments: 1 })
+  if (!first.data?.success) {
+    check('基准页可访问', false, `${first.data?.error || first.networkError}（服务端是否设置了 ALLOWED_INTERNAL_HOSTS=127.0.0.1？）`)
+    return false
+  }
+
+  check('基准页可访问', true)
+  check(`页面高度为 ${FIXTURE_HEIGHT}px`, first.data.pageHeight === FIXTURE_HEIGHT, `实际 ${first.data.pageHeight}`)
+  check('第一段 offset=0, nextOffset=1080', first.data.nextOffset === 1080, `实际 nextOffset=${first.data.nextOffset}`)
+  check('第一段 isEnd=false', first.data.isEnd === false)
+
+  const raw = await loadRaw(first.data.segments[0].image)
+  check('分段图片宽度为视口宽度 1920', raw.width === 1920, `实际 ${raw.width}`)
+  check('分段图片高度为视口高度 1080', raw.height === 1080, `实际 ${raw.height}`)
+  await verifySegmentPixels(raw, { offset: 0, height: 1080 }, '第 1 段')
+
+  return true
 }
 
-async function testMerge() {
-  console.log('\n长图拼接')
-  const first = await post('/api/screenshot', { url: 'example.com', singleShot: true })
-  const second = await post('/api/screenshot', { url: 'example.com', fullPage: true })
-  if (!first.success || !second.success) {
-    check('拼接前置截图成功', false, '截图阶段失败')
+async function testFixtureBatch() {
+  section('基准页：单请求批量分段（一次加载截多段）')
+
+  const { data } = await post('/api/screenshot', { url: FIXTURE_URL, offset: 0, maxSegments: 5 })
+  if (!data?.success) {
+    check('批量请求成功', false, data?.error || '')
     return
   }
 
-  const data = await post('/api/merge', { screenshots: [first.screenshot, second.screenshot] })
-  check('拼接成功', data.success === true, data.error || '')
-  if (!data.success) return
+  const segments = data.segments || []
+  check('一次请求返回 3 段（3000px / 1080px 向上取整）', segments.length === 3, `实际 ${segments.length} 段`)
+  check('isEnd=true 且 nextOffset=3000', data.isEnd === true && data.nextOffset === 3000, `isEnd=${data.isEnd} nextOffset=${data.nextOffset}`)
 
-  const raw = Buffer.from(data.mergedImage, 'base64')
-  check('返回有效 PNG', raw.subarray(0, 8).equals(PNG_MAGIC), `${raw.length} 字节`)
+  const expected = [
+    { offset: 0, height: 1080 },
+    { offset: 1080, height: 1080 },
+    { offset: 2160, height: 840 }, // 末段按剩余高度裁剪
+  ]
+
+  for (let i = 0; i < Math.min(segments.length, expected.length); i++) {
+    const segment = segments[i]
+    const want = expected[i]
+    check(
+      `第 ${i + 1} 段 offset=${want.offset} height=${want.height}`,
+      segment.offset === want.offset && segment.height === want.height,
+      `实际 offset=${segment.offset} height=${segment.height}`
+    )
+  }
+
+  // 逐段做像素校验，这是判断「有没有重叠 / 跳空」最硬的证据
+  let rawImages = []
+  for (let i = 0; i < segments.length; i++) {
+    rawImages.push(await loadRaw(segments[i].image))
+  }
+  for (let i = 0; i < segments.length; i++) {
+    await verifySegmentPixels(rawImages[i], segments[i], `第 ${i + 1} 段`)
+  }
+
+  const contiguous = segments.every((segment, index) => index === 0 || segments[index - 1].offset + segments[index - 1].height === segment.offset)
+  check('分段首尾相接，无重叠/跳空', contiguous)
+
+  const totalHeight = segments.reduce((sum, segment) => sum + segment.height, 0)
+  check('分段高度之和等于页面总高', totalHeight === FIXTURE_HEIGHT, `${totalHeight} vs ${FIXTURE_HEIGHT}`)
+
+  return segments
+}
+
+async function testFixtureFullPage() {
+  section('基准页：整页截图')
+
+  const { data } = await post('/api/screenshot', { url: FIXTURE_URL, fullPage: true })
+  if (!data?.success) {
+    check('整页截图成功', false, data?.error || '')
+    return null
+  }
+
+  const raw = await loadRaw(data.screenshot)
+  check(`整页图片高度等于页面总高 ${FIXTURE_HEIGHT}`, raw.height === FIXTURE_HEIGHT, `实际 ${raw.height}`)
+  check('整页图片宽度为 1920', raw.width === 1920, `实际 ${raw.width}`)
+
+  // 交叉验证：整页截图与分段截图是两条独立路径，结果必须一致
+  const midColor = pixelAt(raw, 10, 1019)
+  check('整页在 y=1019 处的颜色与分段第 1 段末行一致', colorsClose(midColor, bandColorAt(1019)), formatColor(midColor, bandColorAt(1019)))
+
+  return data.screenshot
+}
+
+async function testMerge(segments) {
+  section('长图拼接')
+
+  if (!segments || segments.length === 0) {
+    check('拼接前置截图成功', false, '没有可用的分段')
+    return
+  }
+
+  const { data } = await post('/api/merge', { screenshots: segments.map(segment => segment.image) })
+  check('拼接成功', data?.success === true, data?.error || '')
+  if (!data?.success) return
+
+  const raw = await loadRaw(data.mergedImage)
+  check(`拼接结果高度等于页面总高 ${FIXTURE_HEIGHT}`, raw.height === FIXTURE_HEIGHT, `实际 ${raw.height}`)
+  check('拼接结果宽度为 1920', raw.width === 1920, `实际 ${raw.width}`)
+
+  // 拼接后仍应保持分段原貌：抽查两个分段边界处的颜色
+  const boundaryChecks = [
+    { y: 0, label: '顶部 y=0' },
+    { y: 1079, label: '第 1 段末行 y=1079' },
+    { y: 1080, label: '第 2 段首行 y=1080' },
+    { y: 2999, label: '最后一行 y=2999' },
+  ]
+  for (const { y, label } of boundaryChecks) {
+    const color = pixelAt(raw, 10, y)
+    check(`${label} 颜色正确`, colorsClose(color, bandColorAt(y)), formatColor(color, bandColorAt(y)))
+  }
 
   const empty = await post('/api/merge', { screenshots: [] })
-  check('空数组应被拒绝', empty.success === false, empty.error || '未报错')
+  check('空数组应被拒绝', empty.status === 400, `HTTP ${empty.status}`)
+
+  const tooMany = await post('/api/merge', { screenshots: new Array(61).fill(segments[0].image) })
+  check('超过 60 段应被拒绝', tooMany.status === 400, `HTTP ${tooMany.status} ${tooMany.data?.error || ''}`)
+}
+
+async function testSingleShot() {
+  section('基准页：普通截图（当前视口）')
+
+  const { data } = await post('/api/screenshot', { url: FIXTURE_URL, singleShot: true })
+  if (!data?.success) {
+    check('普通截图成功', false, data?.error || '')
+    return
+  }
+
+  const raw = await loadRaw(data.screenshot)
+  check('尺寸为 1920x1080', raw.width === 1920 && raw.height === 1080, `实际 ${raw.width}x${raw.height}`)
+  check('顶部颜色对应 y=0', colorsClose(pixelAt(raw, 10, 0), bandColorAt(0)), formatColor(pixelAt(raw, 10, 0), bandColorAt(0)))
+}
+
+async function testRateLimit() {
+  section('限流（放在最后，会消耗掉本机额度）')
+
+  let got429 = false
+  let attempts = 0
+
+  // 用必然校验失败的入参：请求会走到限流器，但不会真的启动浏览器，所以很快
+  for (let i = 0; i < 400; i++) {
+    attempts++
+    const { status, headers } = await post('/api/screenshot', { url: '' })
+    if (status === 429) {
+      got429 = true
+      check('超量请求返回 429', true, `第 ${attempts} 次请求触发`)
+      check('429 带 Retry-After 头', Boolean(headers.get('retry-after')), `Retry-After=${headers.get('retry-after')}`)
+      break
+    }
+  }
+
+  if (!got429) {
+    check('超量请求返回 429', false, `连续 ${attempts} 次请求都没有被限流`)
+  }
+}
+
+async function testExternal() {
+  section('外网站点（SMOKE_EXTERNAL=1）')
+
+  const { data } = await post('/api/screenshot', { url: 'example.com', singleShot: true })
+  check('example.com 普通截图成功', data?.success === true, data?.error || '')
+  if (data?.success) {
+    const raw = Buffer.from(data.screenshot, 'base64')
+    check('返回有效 PNG', raw.subarray(0, 8).equals(PNG_MAGIC), `${raw.length} 字节`)
+  }
+
+  const { data: wiki } = await post('/api/screenshot', { url: 'https://en.wikipedia.org/wiki/Screenshot', maxSegments: 2 })
+  check('维基百科分段截图成功', wiki?.success === true, wiki?.error || '')
+  if (wiki?.success) {
+    check('返回 2 段', (wiki.segments || []).length === 2, `实际 ${(wiki.segments || []).length} 段`)
+  }
 }
 
 async function main() {
   console.log(`LinkSnapper 冒烟测试 → ${BASE_URL}`)
+  console.log(`基准页：${FIXTURE_URL}`)
+
   try {
+    await testHealth()
     await testSecurity()
-    await testValidation()
+    await testRedirectSsrf()
     await testNoFalsePositive()
-    await testSingleShot()
-    await testSegmented()
-    await testFullPage()
-    await testMerge()
+    await testValidation()
+
+    const fixtureOk = await testFixtureBasics()
+    if (fixtureOk) {
+      await testSingleShot()
+      const segments = await testFixtureBatch()
+      await testFixtureFullPage()
+      await testMerge(segments)
+    } else {
+      console.log('\n\x1b[33m基准页不可用，跳过所有分段 / 拼接用例\x1b[0m')
+    }
+
+    if (RUN_EXTERNAL) {
+      await testExternal()
+    } else {
+      section('外网站点')
+      console.log('  已跳过（需要联网时加 SMOKE_EXTERNAL=1）')
+    }
+
+    await testRateLimit()
   } catch (error) {
-    console.error('\n测试执行中断：', error.message)
+    console.error('\n测试执行中断：', error)
     failed++
   }
 

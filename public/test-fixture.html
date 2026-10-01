@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>LinkSnapper 测试基准页</title>
+    <style>
+      /*
+       * 冒烟测试用的确定性页面。
+       *
+       * 设计成 N 个固定 60px 高的纯色横条，颜色按固定顺序循环。
+       * 这样测试就能反推「服务端截的这一段到底落在页面的哪个位置」：
+       * 只要读出图片首行 / 末行的颜色，就能算出真实的 y 区间，
+       * 从而验证分段首尾相接、没有重叠也没有跳空 —— 这比只看段高之和可靠得多。
+       *
+       * 60 正好整除 1080（视口高度），所以每个分段起点都落在色带边界上。
+       */
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: #000000;
+        overflow-x: hidden;
+        font-family: system-ui, sans-serif;
+      }
+      #bands {
+        width: 100%;
+      }
+      .band {
+        height: 60px;
+        width: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="bands"></div>
+
+    <!--
+      内网探针：img 与 script 都指向内网地址。
+      请求拦截必须把它们 abort 掉，同时不能影响页面渲染，所以用绝对定位
+      让它们完全不参与布局 —— 页面高度仍然是精确的 3000px。
+      这样一来，所有基准页用例都隐式验证了一条重要的回归：
+      「拦截子资源之后必须让页面继续正常渲染，不能卡死也不能撑高」。
+    -->
+    <img
+      src="http://10.0.0.5/probe.png"
+      alt=""
+      style="position: absolute; left: -9999px; top: 0; width: 1px; height: 1px"
+    />
+    <script src="http://169.254.169.254/probe.js"></script>
+
+    <script>
+      // 10 种区分度足够高的颜色，按索引循环
+      window.__BANDS = [
+        '#dc2626',
+        '#ea580c',
+        '#ca8a04',
+        '#16a34a',
+        '#0891b2',
+        '#2563eb',
+        '#7c3aed',
+        '#db2777',
+        '#78350f',
+        '#334155',
+      ]
+      var BAND_HEIGHT = 60
+      var BAND_COUNT = 50 // 50 * 60 = 3000px
+
+      var container = document.getElementById('bands')
+      for (var i = 0; i < BAND_COUNT; i++) {
+        var band = document.createElement('div')
+        band.className = 'band'
+        band.style.background = window.__BANDS[i % window.__BANDS.length]
+        band.dataset.index = String(i)
+        container.appendChild(band)
+      }
+    </script>
+  </body>
+</html>

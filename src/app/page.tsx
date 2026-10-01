@@ -1,6 +1,6 @@
 'use client'
 
-import React, { useState, useCallback } from 'react'
+import React, { useState, useCallback, useRef } from 'react'
 import { useTheme } from 'next-themes'
 
 const PROCESS_STEPS = [
@@ -9,6 +9,27 @@ const PROCESS_STEPS = [
   '正在等待内容加载...',
   '正在截取画面...',
 ]
+
+/** 单次请求向服务端索要的段数，与服务端 DEFAULT_MAX_SEGMENTS 对应 */
+const BATCH_SIZE = 6
+/** 「一次截到底」的安全上限，防止在无限滚动站点上循环不停 */
+const MAX_AUTO_BATCHES = 20
+
+interface SegmentPayload {
+  offset: number
+  height: number
+  image: string
+}
+
+interface ScreenshotApiResponse {
+  success: boolean
+  error?: string
+  screenshot?: string
+  segments?: SegmentPayload[]
+  isEnd?: boolean
+  nextOffset?: number
+  pageHeight?: number
+}
 
 // 加载动画组件
 const LoadingAnimation = ({ onClose, progress = 0 }: { onClose: () => void; progress?: number }) => (
@@ -86,8 +107,13 @@ export default function Home() {
   // 分段截图的下一个起点由服务端回传，前端持有，服务端保持无状态
   const [nextOffset, setNextOffset] = useState(0)
   const [reachedEnd, setReachedEnd] = useState(false)
+  const [pageHeight, setPageHeight] = useState(0)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
   const { theme, setTheme } = useTheme()
+
+  // 用 ref 持有游标，避免「一次截到底」的循环里读到闭包中的旧值
+  const cursorRef = useRef(0)
+  const endRef = useRef(false)
 
   const startProgress = useCallback(() => {
     setCaptureProgress(0)
@@ -113,6 +139,13 @@ export default function Home() {
     }, 500)
   }, [])
 
+  const abortProgress = useCallback((interval: ReturnType<typeof setInterval>) => {
+    clearInterval(interval)
+    setCaptureProgress(0)
+    setIsCapturing(false)
+    setShowGame(false)
+  }, [])
+
   const downloadImage = (base64: string, filename: string) => {
     const link = document.createElement('a')
     link.href = `data:image/png;base64,${base64}`
@@ -122,56 +155,112 @@ export default function Home() {
     document.body.removeChild(link)
   }
 
-  /** 分段／普通截图共用的请求逻辑 */
-  const captureScreenshot = async (payload: Record<string, unknown>, showOverlay: boolean) => {
-    setIsCapturing(true)
-    setErrorMessage(null)
-    if (showOverlay) setShowGame(true)
-    const progressInterval = startProgress()
+  /**
+   * 请求一批分段截图：
+   *   0 段  → 已到页面底部
+   *   1 段  → 普通截图 / 最后一段，一个请求就能拿完，不再每段重启浏览器
+   *   多段  → 一次请求连续截取，页面只加载一次
+   * 返回 false 表示失败，调用方应立即停止循环。
+   */
+  const requestSegments = async (payload: Record<string, unknown>): Promise<boolean> => {
+    const response = await fetch('/api/screenshot', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
 
-    try {
-      const response = await fetch('/api/screenshot', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-      const data = await response.json()
+    const data = (await response.json()) as ScreenshotApiResponse
 
-      if (!data.success) {
-        throw new Error(data.error || '截图失败')
+    if (!response.ok || !data.success) {
+      if (response.status === 429) {
+        const retryAfter = response.headers.get('Retry-After')
+        throw new Error(
+          `请求过于频繁${retryAfter ? `，请约 ${retryAfter} 秒后重试` : '，请稍后重试'}`
+        )
       }
-
-      // 有图就先挂上去（末段也可能带一张有效图片），再判断是否到底
-      if (data.screenshot) {
-        setScreenshots(prev => [...prev, data.screenshot as string])
-      }
-      setNextOffset(typeof data.nextOffset === 'number' ? data.nextOffset : 0)
-      setReachedEnd(Boolean(data.isEnd))
-
-      stopProgress(progressInterval)
-      return true
-    } catch (error) {
-      clearInterval(progressInterval)
-      setCaptureProgress(0)
-      setIsCapturing(false)
-      setShowGame(false)
-      setErrorMessage(error instanceof Error ? error.message : '截图失败，请稍后重试')
-      return false
+      throw new Error(data.error || '截图失败')
     }
+
+    const images = data.segments?.length
+      ? data.segments.map(segment => segment.image)
+      : data.screenshot
+        ? [data.screenshot]
+        : []
+
+    if (images.length > 0) {
+      setScreenshots(prev => [...prev, ...images])
+    }
+
+    cursorRef.current = typeof data.nextOffset === 'number' ? data.nextOffset : cursorRef.current
+    endRef.current = Boolean(data.isEnd) || images.length === 0
+
+    setNextOffset(cursorRef.current)
+    setReachedEnd(endRef.current)
+    if (typeof data.pageHeight === 'number' && data.pageHeight > 0) {
+      setPageHeight(data.pageHeight)
+    }
+
+    return true
   }
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault()
+    if (isCapturing) return
+
     setScreenshots([])
+    setErrorMessage(null)
     setNextOffset(0)
+    setPageHeight(0)
     setReachedEnd(false)
-    // 服务端无状态，重置只需清空前端自己的游标
-    await captureScreenshot({ url, offset: 0 }, false)
+    cursorRef.current = 0
+    endRef.current = false
+
+    setIsCapturing(true)
+    const progressInterval = startProgress()
+
+    try {
+      await requestSegments({ url, offset: 0, maxSegments: 1 })
+      stopProgress(progressInterval)
+    } catch (error) {
+      abortProgress(progressInterval)
+      setErrorMessage(error instanceof Error ? error.message : '截图失败，请稍后重试')
+    }
   }
 
   const handleContinueCapture = async () => {
-    if (reachedEnd) return
-    await captureScreenshot({ url, offset: nextOffset }, false)
+    if (reachedEnd || isCapturing) return
+
+    setIsCapturing(true)
+    setErrorMessage(null)
+    const progressInterval = startProgress()
+
+    try {
+      await requestSegments({ url, offset: cursorRef.current, maxSegments: BATCH_SIZE })
+      stopProgress(progressInterval)
+    } catch (error) {
+      abortProgress(progressInterval)
+      setErrorMessage(error instanceof Error ? error.message : '截图失败，请稍后重试')
+    }
+  }
+
+  /** 一次截到底：循环请求，直到服务端报告已到底或触及安全上限 */
+  const handleCaptureToEnd = async () => {
+    if (reachedEnd || isCapturing) return
+
+    setIsCapturing(true)
+    setErrorMessage(null)
+    const progressInterval = startProgress()
+
+    try {
+      for (let batch = 0; batch < MAX_AUTO_BATCHES; batch++) {
+        if (endRef.current) break
+        await requestSegments({ url, offset: cursorRef.current, maxSegments: BATCH_SIZE })
+      }
+      stopProgress(progressInterval)
+    } catch (error) {
+      abortProgress(progressInterval)
+      setErrorMessage(error instanceof Error ? error.message : '截图失败，请稍后重试')
+    }
   }
 
   const handleFullPageCapture = async () => {
@@ -186,19 +275,16 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url, fullPage: true }),
       })
-      const data = await response.json()
+      const data = (await response.json()) as ScreenshotApiResponse
 
-      if (!data.success || !data.screenshot) {
+      if (!response.ok || !data.success || !data.screenshot) {
         throw new Error(data.error || '截图失败')
       }
 
       downloadImage(data.screenshot, 'full-page-screenshot.png')
       stopProgress(progressInterval)
     } catch (error) {
-      clearInterval(progressInterval)
-      setCaptureProgress(0)
-      setIsCapturing(false)
-      setShowGame(false)
+      abortProgress(progressInterval)
       setErrorMessage(error instanceof Error ? error.message : '整页截图失败，请稍后重试')
     }
   }
@@ -215,19 +301,16 @@ export default function Home() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ screenshots }),
       })
-      const data = await response.json()
+      const data = (await response.json()) as { success: boolean; error?: string; mergedImage?: string }
 
-      if (!data.success || !data.mergedImage) {
+      if (!response.ok || !data.success || !data.mergedImage) {
         throw new Error(data.error || '合并失败')
       }
 
       stopProgress(progressInterval)
       downloadImage(data.mergedImage, 'merged-screenshot.png')
     } catch (error) {
-      clearInterval(progressInterval)
-      setCaptureProgress(0)
-      setIsCapturing(false)
-      setShowGame(false)
+      abortProgress(progressInterval)
       setErrorMessage(error instanceof Error ? error.message : '长图拼接失败，请稍后重试')
     }
   }
@@ -310,14 +393,14 @@ export default function Home() {
               <span className="text-4xl">⚡</span>
             </div>
             <h3 className="text-xl font-semibold mb-2 text-primary">快速处理</h3>
-            <p className="text-card-foreground/80">自动识别网站类型，智能等待内容加载</p>
+            <p className="text-card-foreground/80">复用浏览器实例，一次请求连续截取多段</p>
           </div>
           <div className="p-6 rounded-lg bg-card shadow-lg">
             <div className="mb-4">
               <span className="text-4xl">🔒</span>
             </div>
             <h3 className="text-xl font-semibold mb-2 text-primary">安全可靠</h3>
-            <p className="text-card-foreground/80">内置地址校验，阻止对内网服务的探测</p>
+            <p className="text-card-foreground/80">地址校验 + 请求拦截，挡住跳转与子资源探测</p>
           </div>
         </div>
 
@@ -330,8 +413,16 @@ export default function Home() {
                   disabled={isCapturing || reachedEnd}
                   className="flex items-center gap-2 px-6 py-3 rounded-lg bg-primary text-primary-foreground font-medium hover:opacity-90 transition-colors text-lg disabled:opacity-40"
                 >
-                  <span>{reachedEnd ? '已到页面底部' : '继续截图下一页'}</span>
+                  <span>{reachedEnd ? '已到页面底部' : `继续截图（${BATCH_SIZE} 段/次）`}</span>
                   <span className="text-xl">📸</span>
+                </button>
+                <button
+                  onClick={handleCaptureToEnd}
+                  disabled={isCapturing || reachedEnd}
+                  className="flex items-center gap-2 px-6 py-3 rounded-lg border-2 border-primary text-primary font-medium hover:bg-primary/5 transition-colors text-lg group disabled:opacity-40"
+                >
+                  <span>一次截到底</span>
+                  <span className="text-xl group-hover:scale-110 transition-transform">⏩</span>
                 </button>
                 <button
                   onClick={handleMergeSave}
@@ -353,7 +444,8 @@ export default function Home() {
             </div>
 
             <p className="text-card-foreground/60 text-sm">
-              已截取 {screenshots.length} 段（当前游标 {nextOffset}px）
+              已截取 {screenshots.length} 段（当前游标 {nextOffset}px
+              {pageHeight > 0 ? ` / 页面总高 ${pageHeight}px` : ''}）
             </p>
 
             <div className="grid gap-6">
