@@ -177,6 +177,62 @@ npm run bench         # 分段截图性能对照（需服务已在跑）
 
 返回进程与浏览器状态、当前生效的安全开关，可直接用作容器健康检查。
 
+## MCP server（让 AI Agent 能"看见"网页）
+
+[MCP（Model Context Protocol）](https://modelcontextprotocol.io) 是 AI 客户端调用外部工具的标准协议。
+server 声明自己有哪些工具，客户端（Claude Desktop / Claude Code / Cursor / Windsurf）启动时自动发现，
+模型自己决定何时调用，结果直接回到对话里。
+
+本项目内置了一个 MCP server，把截图能力暴露给 Agent。
+
+### 配置
+
+Claude Desktop：`设置 → 开发者 → 编辑配置`；Cursor：项目下 `.cursor/mcp.json`。
+
+```json
+{
+  "mcpServers": {
+    "linksnapper": {
+      "command": "npx",
+      "args": ["-y", "linksnapper-mcp"],
+      "env": {
+        "LINKSNAPPER_BASE_URL": "http://127.0.0.1:3000",
+        "LINKSNAPPER_TOKEN": "可选，服务端设了 SCREENSHOT_API_TOKEN 时才需要"
+      }
+    }
+  }
+}
+```
+
+Claude Code 一行搞定：
+
+```bash
+claude mcp add linksnapper npx -y linksnapper-mcp \
+  -e LINKSNAPPER_BASE_URL=http://127.0.0.1:3000
+```
+
+### 暴露的工具
+
+| 工具 | 用途 |
+|---|---|
+| `take_screenshot` | 通用截图：视口 / 整页 / selector / clip 四选一 |
+| `capture_element` | 按 CSS 选择器只截某个元素（可超出视口） |
+| `capture_region` | 按页面坐标截取矩形区域 |
+| `capture_full_page` | 整页截图 |
+| `capture_segmented` | 超长页面分段截取，带 `offset` 续传 |
+| `get_service_health` | 查看 Chromium 就绪状态、版本、限流模式、队列深度 |
+
+### 为什么 Agent 场景必须自带 SSRF 防护
+
+Agent 场景下**截图 URL 往往来自模型输出或网页内容**。一段植入在页面里的文本就能诱导
+Agent 去截 `169.254.169.254/latest/meta-data/`（云主机元数据）或 `10.0.0.5/admin`，
+把内网结构原封不动送回对话。这类提示词注入在纯文本链路里很难察觉，
+而截图是最容易被利用的通道之一 —— 因为它能"看见"内网管理界面。
+
+本项目的两层防护（URL 字面量校验 + 浏览器逐个请求拦截）在 MCP 链路上同样生效，
+且**拒绝原因会原样透传给模型**（而不是含糊地报"失败"），
+让模型知道"这个地址不允许截"并据此调整。
+
 ## Docker 部署
 
 ```bash
