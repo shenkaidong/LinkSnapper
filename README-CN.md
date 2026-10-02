@@ -202,6 +202,17 @@ docker run -d -p 3000:3000 --shm-size=1g linksnapper
 > `PUPPETEER_REVISIONS.chrome`），并重新构建镜像即可；`HEADLESS_MODE` 也已能按
 > puppeteer 主版本自动适配（22+ 自动回退 `true`，无需手工改代码）。
 
+> ⚠️ **Linux ARM64（Apple Silicon 容器 / AWS Graviton）会自动降级 Chrome 版本**
+> Chrome for Testing **并非每个版本都提供全部平台**：puppeteer-core 锁定的
+> 121.0.6167.85 **没有** `linux-arm64` 构建（`linux-arm64` 是从 153.0.8001.0 才开始的）。
+> 早期版本会把 x86_64 二进制下载进名为 `linux_arm` 的目录里，**构建期完全看不出来**，
+> 直到运行时才报 `rosetta error: failed to open elf at /lib64/ld-linux-x86-64.so.2`。
+> 现在安装脚本会：① 显式传 platform 给下载器；② 下载后读 ELF 头校验真实架构；
+> ③ 不匹配则自动回退到该平台确实存在的稳定版（如 154.x）并大声告警。
+> 实测 Apple Silicon 容器回退到 154.0.8037.92（原生 arm64）后，容器内 92 项冒烟全通过。
+> 依赖 `@puppeteer/browsers` **必须 ≥ 3.x** —— 2.x 的 `folder(LINUX_ARM)` 恒返回
+> `linux64`，即使传对 platform 也会下错架构。
+
 ## 安全说明
 
 截图接口本质上提供了「让服务器访问任意地址」的能力，因此防护分两层：

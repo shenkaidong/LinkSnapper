@@ -47,8 +47,25 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     tini \
     && rm -rf /var/lib/apt/lists/*
 
+WORKDIR /app
+
+# 先只复制依赖清单，充分利用构建缓存。
+# 注意：此时不能设置 NODE_ENV=production，否则 npm ci 会跳过 typescript / tailwind
+# 等构建期必需的 devDependencies，后面 npm run build 会直接失败。
+COPY package.json package-lock.json ./
+
+# 清理缓存并按锁文件安装依赖
+RUN npm cache clean --force && \
+    npm ci --legacy-peer-deps && \
+    npm cache clean --force
+
 # 把与 puppeteer-core 锁定的 Chrome 装进 /opt/chrome，并软链到固定路径，
 # 后续用 ENV CHROME_PATH 指向这个软链即可，不依赖具体版本目录名。
+#
+# 这一步必须排在 npm ci **之后**：install-chrome.mjs 依赖 devDependency
+# @puppeteer/browsers 去下载 Chrome-for-Testing，同时要读取已安装的
+# puppeteer-core 版本来决定下载哪个构建 —— 在装依赖之前跑会直接 MODULE_NOT_FOUND。
+COPY scripts/install-chrome.mjs ./scripts/install-chrome.mjs
 ENV CHROME_CACHE_DIR=/opt/chrome
 RUN CHROME_PATH_MARKER=/tmp/chrome-path node scripts/install-chrome.mjs \
     && ln -sf "$(cat /tmp/chrome-path)" /usr/bin/chrome-for-testing \
@@ -63,25 +80,11 @@ ENV CHROME_PATH=/usr/bin/chrome-for-testing \
     LANG=C.UTF-8 \
     LC_ALL=C.UTF-8
 
-WORKDIR /app
-
-# 先只复制依赖清单与安装脚本，充分利用构建缓存。
-# 注意：此时不能设置 NODE_ENV=production，否则 npm ci 会跳过 typescript / tailwind
-# 等构建期必需的 devDependencies，后面 npm run build 会直接失败。
-COPY package.json package-lock.json ./
-COPY scripts/install-chrome.mjs ./scripts/install-chrome.mjs
-
-# 清理缓存并按锁文件安装依赖
-RUN npm cache clean --force && \
-    npm ci --legacy-peer-deps && \
-    npm cache clean --force
-
 # 再复制源码
 COPY . .
 
-# 构建应用
-RUN npm run build && \
-    chown -R pptruser:pptruser /app || true
+# 构建应用（用户要到下一步才创建，这里不能 chown pptruser）
+RUN npm run build
 
 # 创建非 root 用户
 RUN addgroup --system pptruser && adduser --system --ingroup pptruser pptruser \
