@@ -20,11 +20,15 @@ export class TokenBucketLimiter {
    * @param capacity 突发容量（令牌数）
    * @param refillPerSecond 每秒补充速率
    * @param backend 状态后端，默认进程内 Map；多实例部署传 RedisBackend
+   * @param clock 时间源，默认 Date.now()。
+   *   可注入是为了让测试摆脱真实时间：令牌桶的行为依赖「两次取令牌之间过了多久」，
+   *   用真实时间写断言必然 flaky（每次 await 都会补回令牌），注入固定时钟才能确定性验证。
    */
   constructor(
     private readonly capacity: number,
     private readonly refillPerSecond: number,
-    backend?: RateLimitBackend
+    backend?: RateLimitBackend,
+    private readonly clock: () => number = () => Date.now()
   ) {
     this.backend = backend ?? new InMemoryBackend()
   }
@@ -34,7 +38,7 @@ export class TokenBucketLimiter {
    * @returns allowed 是否放行；retryAfterSec 被拒时建议的等待秒数
    */
   async take(key: string): Promise<{ allowed: boolean; retryAfterSec: number; remaining: number }> {
-    const now = Date.now()
+    const now = this.clock()
     // 桶的生存时间 = 回满所需时长 + 1s 余量，过期后由后端自动回收
     const ttlMs = Math.ceil((this.capacity / this.refillPerSecond) * 1000) + 1000
 

@@ -12,6 +12,17 @@ import assert from 'node:assert/strict'
 import { TokenBucketLimiter, BoundedSemaphore, QueueFullError, QueueTimeoutError, getClientKey } from '../src/utils/rate-limit.ts'
 import { createRateLimitBackend, InMemoryBackend } from '../src/utils/rate-limit-store.ts'
 
+/** 可控时钟：让令牌桶的时间推进完全由测试决定 */
+function fakeClock(): { now: () => number; advance: (ms: number) => void } {
+  let current = 1_000_000
+  return {
+    now: () => current,
+    advance: (ms: number) => {
+      current += ms
+    },
+  }
+}
+
 describe('TokenBucketLimiter', () => {
   test('容量用尽前放行，用尽后拒绝', async () => {
     const limiter = new TokenBucketLimiter(3, 0)
@@ -33,25 +44,34 @@ describe('TokenBucketLimiter', () => {
     assert.equal((await limiter.take('b')).allowed, true)
   })
 
+  // 下面两个用例用注入的固定时钟，而不是真实时间。
+  //
+  // 原因：令牌桶是否放行取决于「两次取令牌之间流逝了多久」。用真实时间时，
+  // 每次 await take() 本身就会耗掉约 1ms，而补充速率是 1000/秒 —— 一次 await
+  // 就补回 1 个令牌，导致「本该被拒的第 3 次请求」被放行。这种断言只在机器
+  // 负载恰好够低时才通过，属于典型的 flaky 测试（调依赖补丁改变调度时序就会翻车）。
   test('随时间补充令牌', async () => {
-    // 容量 1，每秒补 50 个 —— 等 40ms 就足够回满
-    const limiter = new TokenBucketLimiter(1, 50)
+    const clock = fakeClock()
+    const limiter = new TokenBucketLimiter(1, 50, undefined, clock.now)
 
     assert.equal((await limiter.take('ip')).allowed, true)
     assert.equal((await limiter.take('ip')).allowed, false)
 
-    await new Promise(resolve => setTimeout(resolve, 60))
-    assert.equal((await limiter.take('ip')).allowed, true, '等待后应恢复额度')
+    clock.advance(60) // 60ms × 50/秒 = 3 个令牌，足够回满容量 1
+    assert.equal((await limiter.take('ip')).allowed, true, '时间推进后应恢复额度')
   })
 
   test('补充不会超过容量上限', async () => {
-    const limiter = new TokenBucketLimiter(2, 1000)
-    await new Promise(resolve => setTimeout(resolve, 30))
+    const clock = fakeClock()
+    const limiter = new TokenBucketLimiter(2, 1000, undefined, clock.now)
 
-    // 即便过了很久，也只能拿到容量上限那么多
+    // 推进 10 秒 = 理论补充 10000 个令牌，但上限是容量 2
+    clock.advance(10_000)
+
+    // 时钟由测试掌控，三次 take 之间不流逝时间，因此结果是确定的
     assert.equal((await limiter.take('ip')).allowed, true)
     assert.equal((await limiter.take('ip')).allowed, true)
-    assert.equal((await limiter.take('ip')).allowed, false)
+    assert.equal((await limiter.take('ip')).allowed, false, '回满后最多只能取到容量上限')
   })
 
   test('不补充（refill=0）被拒时给出有限等待值而非 Infinity', async () => {
