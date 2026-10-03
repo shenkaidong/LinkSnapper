@@ -1,0 +1,109 @@
+name: Publish
+
+# 发版流水线：打 tag 就发布，推送 main 则只更新容器镜像的 latest。
+#
+# 需要两个 secret：
+#   NPM_TOKEN  —— npmjs.com 的 Automation 令牌（settings → Access Tokens →
+#                 类型选 Automation，绕过 2FA）。没有它 npm publish 会 401。
+#   GITHUB_TOKEN —— GHCR 推送用，仓库自带，不需要手动配。
+#
+# 两个 job 都只在 tag 上跑发布动作；main 上只构建镜像，不发布，
+# 避免"每次 push 都往 npm 发一个版本"。
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*.*.*']
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ---------------------------------------------------------------------
+  # 容器镜像 → ghcr.io/<owner>/linksnapper
+  # ---------------------------------------------------------------------
+  image:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算镜像元数据
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner_lowercase }}/linksnapper
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,prefix=,format=short
+
+      - name: 构建并推送（amd64 + arm64）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_type == 'tag' && github.ref_name || 'main' }}
+            REVISION=${{ github.sha }}
+            CREATED=${{ github.event.head_commit.timestamp }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------
+  # npm 包 linksnapper-mcp
+  # ---------------------------------------------------------------------
+  npm:
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # npm provenance：把包的构建来源写进 npm 的公开审计日志。
+      # 不是必需，但对"这个包是从哪个 commit 构建的"提供了可验证的答案。
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+
+      - name: 版本号必须与 tag 一致
+        run: |
+          TAG="${GITHUB_REF_NAME#v}"
+          PKG="$(node -p "require('./mcp/package.json').version")"
+          echo "tag=$TAG package=$PKG"
+          if [ "$TAG" != "$PKG" ]; then
+            echo "::error::mcp/package.json 的版本 $PKG 与 tag $TAG 不一致。" \
+                 "发版前请先改 mcp/package.json 的版本号。" >&2
+            exit 1
+          fi
+
+      - name: 发布
+        run: npm publish --access public
+        working-directory: mcp
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: true

@@ -53,12 +53,50 @@ const COMMON_SCREENSHOT_PROPS = {
   },
   format: {
     type: 'string',
-    enum: ['png', 'jpeg', 'webp'],
-    description: '输出格式，默认 png。分段模式下恒为 png。',
+    enum: ['png', 'jpeg', 'webp', 'pdf'],
+    description: '输出格式，默认 png。分段模式下恒为 png。pdf 会以文件资源形式返回，不是图片。',
   },
   quality: {
     type: 'number',
     description: 'jpeg / webp 的质量，1-100，默认 80。png 为无损格式，忽略此参数。',
+  },
+  device: {
+    type: 'string',
+    enum: ['mobile', 'tablet', 'desktop'],
+    description: '设备预设。会同时设置分辨率、deviceScaleFactor 与 isMobile/hasTouch —— 只改分辨率不触发响应式断点，截出来仍是桌面布局。',
+  },
+  width: { type: 'number', description: '视口宽度（CSS 像素）。给了 device 时以此覆盖预设宽度。' },
+  height: { type: 'number', description: '视口高度（CSS 像素）。给了 device 时以此覆盖预设高度。' },
+  deviceScaleFactor: {
+    type: 'number',
+    description: '像素密度，1-3。2 或 3 得到视网膜级清晰度，代价是图片体积成倍增长。',
+  },
+  darkMode: {
+    type: 'boolean',
+    description: '以 prefers-color-scheme: dark 渲染，用于截取页面的暗色版本。',
+  },
+  blockAds: {
+    type: 'boolean',
+    description: '拦截广告与统计追踪请求。截图是给视觉模型看时尤其有用 —— 广告位会干扰判断。',
+  },
+  blockCookieBanners: {
+    type: 'boolean',
+    description: '隐藏 "接受 Cookie" 之类的 consent 弹窗。',
+  },
+  hideSelectors: {
+    type: 'array',
+    items: { type: 'string' },
+    description: '要隐藏的元素 CSS 选择器列表（最多 20 个），用于去掉浮窗、导航栏等噪声。',
+  },
+  css: { type: 'string', description: '注入到页面的自定义 CSS，在截图前生效。' },
+  js: { type: 'string', description: '注入到页面的自定义 JavaScript，在截图前执行。' },
+  waitForSelector: {
+    type: 'string',
+    description: '等到这个 CSS 选择器出现后再截图。页面内容是异步加载时用它，比固定延时可靠。',
+  },
+  waitForTimeout: {
+    type: 'number',
+    description: '页面就绪后额外等待的毫秒数，上限 30000。仅在确实需要时使用。',
   },
   selector: {
     type: 'string',
@@ -99,13 +137,11 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        url: COMMON_SCREENSHOT_PROPS.url,
+        ...COMMON_SCREENSHOT_PROPS,
         selector: {
           type: 'string',
           description: 'CSS 选择器，未匹配到任何元素时返回错误。',
         },
-        format: COMMON_SCREENSHOT_PROPS.format,
-        quality: COMMON_SCREENSHOT_PROPS.quality,
       },
       required: ['url', 'selector'],
     },
@@ -116,13 +152,11 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        url: COMMON_SCREENSHOT_PROPS.url,
+        ...COMMON_SCREENSHOT_PROPS,
         x: { type: 'number', description: '左上角 x 坐标' },
         y: { type: 'number', description: '左上角 y 坐标' },
         width: { type: 'number', description: '宽度，必须为正数' },
         height: { type: 'number', description: '高度，必须为正数' },
-        format: COMMON_SCREENSHOT_PROPS.format,
-        quality: COMMON_SCREENSHOT_PROPS.quality,
       },
       required: ['url', 'x', 'y', 'width', 'height'],
     },
@@ -132,11 +166,7 @@ const TOOLS = [
     description: '截取完整页面（含懒加载内容）。页面过高时会被服务端拒绝并返回上限提示，此时应改用分段。',
     inputSchema: {
       type: 'object',
-      properties: {
-        url: COMMON_SCREENSHOT_PROPS.url,
-        format: COMMON_SCREENSHOT_PROPS.format,
-        quality: COMMON_SCREENSHOT_PROPS.quality,
-      },
+      properties: COMMON_SCREENSHOT_PROPS,
       required: ['url'],
     },
   },
@@ -147,7 +177,7 @@ const TOOLS = [
     inputSchema: {
       type: 'object',
       properties: {
-        url: COMMON_SCREENSHOT_PROPS.url,
+        ...COMMON_SCREENSHOT_PROPS,
         offset: { type: 'number', description: '本次起始纵坐标，首次调用传 0 或省略。' },
         maxSegments: { type: 'number', description: '本次最多返回几段，1-12，默认 6。' },
       },
@@ -212,10 +242,70 @@ async function capture(body) {
   return payload
 }
 
+/**
+ * 从工具入参里挑出服务端认识的那部分。
+ *
+ * 显式白名单而不是 `...args` 全量透传：MCP 客户端可能塞入 schema 之外的字段，
+ * 全量透传会让服务端的参数校验替模型背锅（报出模型看不懂的 400）。
+ * 这里只挑我们声明过的，其它一律丢弃。
+ */
+const FORWARDABLE_KEYS = [
+  'url',
+  'format',
+  'quality',
+  'selector',
+  'clip',
+  'device',
+  'width',
+  'height',
+  'deviceScaleFactor',
+  'darkMode',
+  'blockAds',
+  'blockCookieBanners',
+  'hideSelectors',
+  'css',
+  'js',
+  'waitForSelector',
+  'waitForTimeout',
+  'fullPage',
+  'offset',
+  'maxSegments',
+  'singleShot',
+]
+
+function buildCaptureBody(args, extra = {}) {
+  const body = { ...extra }
+  for (const key of FORWARDABLE_KEYS) {
+    if (args[key] !== undefined) body[key] = args[key]
+  }
+  return body
+}
+
 const MIME_BY_FORMAT = { png: 'image/png', jpeg: 'image/jpeg', webp: 'image/webp' }
+
+/** PDF 不是图片，放进 image 块客户端会直接渲染失败，必须走资源块。 */
+function pdfToContent(payload) {
+  const base64 = payload.segments?.[0]?.image
+  if (!base64) return [{ type: 'text', text: '服务端未返回 PDF 内容。' }]
+
+  const sizeKb = Math.round((base64.length * 3) / 4 / 1024)
+  return [
+    {
+      type: 'resource',
+      resource: {
+        uri: `linksnapper://capture/${Date.now()}.pdf`,
+        mimeType: 'application/pdf',
+        blob: base64,
+      },
+    },
+    { type: 'text', text: `已生成 PDF（约 ${sizeKb} KB，A4，含背景图）。` },
+  ]
+}
 
 /** 把接口返回的 segments 转成 MCP 的 content（图片 + 文字说明） */
 function segmentsToContent(payload) {
+  if (payload.format === 'pdf') return pdfToContent(payload)
+
   const segments = payload.segments || []
   if (segments.length === 0) {
     return [{ type: 'text', text: '服务未返回任何图片分段。' }]
@@ -252,58 +342,26 @@ function segmentsToContent(payload) {
 
 async function handleTool(name, args = {}) {
   switch (name) {
-    case 'take_screenshot': {
-      const payload = await capture({
-        url: args.url,
-        fullPage: Boolean(args.fullPage),
-        selector: args.selector,
-        clip: args.clip,
-        format: args.format,
-        quality: args.quality,
-        offset: args.offset,
-        maxSegments: args.maxSegments,
-      })
-      return segmentsToContent(payload)
-    }
+    case 'take_screenshot':
+      return segmentsToContent(await capture(buildCaptureBody(args, { fullPage: Boolean(args.fullPage) })))
 
-    case 'capture_element': {
-      const payload = await capture({
-        url: args.url,
-        selector: args.selector,
-        format: args.format,
-        quality: args.quality,
-      })
-      return segmentsToContent(payload)
-    }
+    case 'capture_element':
+      return segmentsToContent(await capture(buildCaptureBody(args, { selector: args.selector })))
 
-    case 'capture_region': {
-      const payload = await capture({
-        url: args.url,
-        clip: { x: args.x, y: args.y, width: args.width, height: args.height },
-        format: args.format,
-        quality: args.quality,
-      })
-      return segmentsToContent(payload)
-    }
+    case 'capture_region':
+      return segmentsToContent(
+        await capture(
+          buildCaptureBody(args, {
+            clip: { x: args.x, y: args.y, width: args.width, height: args.height },
+          })
+        )
+      )
 
-    case 'capture_full_page': {
-      const payload = await capture({
-        url: args.url,
-        fullPage: true,
-        format: args.format,
-        quality: args.quality,
-      })
-      return segmentsToContent(payload)
-    }
+    case 'capture_full_page':
+      return segmentsToContent(await capture(buildCaptureBody(args, { fullPage: true })))
 
-    case 'capture_segmented': {
-      const payload = await capture({
-        url: args.url,
-        offset: args.offset,
-        maxSegments: args.maxSegments,
-      })
-      return segmentsToContent(payload)
-    }
+    case 'capture_segmented':
+      return segmentsToContent(await capture(buildCaptureBody(args)))
 
     case 'get_service_health': {
       const { payload } = await callApi('/api/health')

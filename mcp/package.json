@@ -1,0 +1,41 @@
+{
+  "name": "linksnapper-mcp",
+  "version": "1.1.0",
+  "description": "MCP server for LinkSnapper — gives Claude / Cursor / Windsurf the ability to see web pages, with SSRF protection built in.",
+  "type": "module",
+  "bin": {
+    "linksnapper-mcp": "./index.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "screenshot",
+    "website-screenshot",
+    "puppeteer",
+    "chrome",
+    "claude",
+    "cursor",
+    "ai-agent",
+    "ssrf"
+  ],
+  "license": "MIT",
+  "homepage": "https://github.com/shenkaidong/LinkSnapper#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shenkaidong/LinkSnapper.git",
+    "directory": "mcp"
+  },
+  "bugs": {
+    "url": "https://github.com/shenkaidong/LinkSnapper/issues"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.0"
+  }
+}

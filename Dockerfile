@@ -15,6 +15,20 @@
 # 这样就把「版本耦合」从「靠运维盯版本」变成「构建期就固定下来」。
 FROM node:20-bookworm-slim
 
+# OCI 元数据。容器注册表与 k8s 工具会读这些标签；没有它们，
+# 镜像在 GHCR 上既没有说明也没有源码链接，别人搜到也不知道是什么。
+ARG VERSION=dev
+ARG REVISION=unknown
+ARG CREATED=unknown
+LABEL org.opencontainers.image.title="LinkSnapper" \
+      org.opencontainers.image.description="Self-hostable website screenshot API with two-layer SSRF protection" \
+      org.opencontainers.image.source="https://github.com/shenkaidong/LinkSnapper" \
+      org.opencontainers.image.url="https://github.com/shenkaidong/LinkSnapper" \
+      org.opencontainers.image.licenses="MIT" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.created="${CREATED}"
+
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Chrome-for-Testing 运行所需的系统库（注意：不是 Alpine 的 musl 那一套）。
