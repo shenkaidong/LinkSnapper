@@ -42,3 +42,6 @@ next-env.d.ts
 
 # install-chrome.mjs 写出的本地 Chrome 路径标记
 .chrome-executable-path
+
+# WorkBuddy 会话数据（项目相关，非缓存，但不应进版本库）
+.workbuddy/

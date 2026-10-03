@@ -475,6 +475,206 @@ async function testPreciseShot() {
   check('非法 format 返回 400', badFmt.status === 400, `HTTP ${badFmt.status} ${badFmt.data?.error || ''}`)
 }
 
+// ---------------------------------------------------------------------------
+// 竞品标配能力：视口 / 设备模拟 / 暗色 / 注入 / 隐藏 / 去 Cookie / PDF / 批量
+// ---------------------------------------------------------------------------
+
+const BAND0 = BANDS[0] // rgb(220,38,38)
+const BAND1 = BANDS[1] // rgb(234,88,12)
+
+/** 截一个固定小区域并取色，用来验证"页面修饰是否真的生效" */
+async function clipPixel(body) {
+  const { data, status } = await post('/api/screenshot', {
+    url: FIXTURE_URL,
+    clip: { x: 0, y: 0, width: 60, height: 60 },
+    ...body,
+  })
+  if (!data?.success) return { error: data?.error || `HTTP ${status}` }
+  const raw = await loadRaw(data.screenshot)
+  return { color: pixelAt(raw, 10, 10) }
+}
+
+async function testPageOptions() {
+  section('竞品标配：视口 / 设备模拟')
+
+  const custom = await post('/api/screenshot', { url: FIXTURE_URL, singleShot: true, width: 800, height: 600 })
+  if (custom.data?.success) {
+    const buf = Buffer.from(custom.data.screenshot, 'base64')
+    const w = buf.readUInt32BE(16)
+    const h = buf.readUInt32BE(20)
+    check('自定义视口生效', w === 800 && h === 600, `实际 ${w}x${h}`)
+  } else {
+    check('自定义视口生效', false, custom.data?.error || '')
+  }
+
+  const mobile = await post('/api/screenshot', { url: FIXTURE_URL, singleShot: true, device: 'mobile' })
+  if (mobile.data?.success) {
+    const buf = Buffer.from(mobile.data.screenshot, 'base64')
+    const w = buf.readUInt32BE(16)
+    const h = buf.readUInt32BE(20)
+    // mobile 预设 390x844 @3x —— 必须连 deviceScaleFactor 一起生效，
+    // 只改分辨率不改 isMobile/dsf 的话响应式断点不会触发
+    check('device=mobile 生效（含 3x 缩放）', w === 1170 && h === 2532, `实际 ${w}x${h}`)
+  } else {
+    check('device=mobile 生效（含 3x 缩放）', false, mobile.data?.error || '')
+  }
+
+  const badDevice = await post('/api/screenshot', { url: FIXTURE_URL, singleShot: true, device: 'watch' })
+  check('非法 device 返回 400', badDevice.status === 400, `HTTP ${badDevice.status}`)
+
+  const zeroWidth = await post('/api/screenshot', { url: FIXTURE_URL, singleShot: true, width: 0 })
+  check('width=0 返回 400', zeroWidth.status === 400, `HTTP ${zeroWidth.status}`)
+
+  section('竞品标配：CSS / JS 注入')
+
+  const injectedCss = await clipPixel({
+    css: '.band[data-index="0"] { background: rgb(1,2,3) !important; }',
+  })
+  check(
+    '注入 CSS 生效',
+    injectedCss.color && colorsClose(injectedCss.color, [1, 2, 3]),
+    injectedCss.color ? formatColor(injectedCss.color, [1, 2, 3]) : injectedCss.error
+  )
+
+  const injectedJs = await clipPixel({
+    js: "document.querySelector('.band[data-index=\"0\"]').style.background = 'rgb(4,5,6)'",
+  })
+  check(
+    '注入 JS 生效',
+    injectedJs.color && colorsClose(injectedJs.color, [4, 5, 6]),
+    injectedJs.color ? formatColor(injectedJs.color, [4, 5, 6]) : injectedJs.error
+  )
+
+  const hugeCss = await post('/api/screenshot', { url: FIXTURE_URL, singleShot: true, css: 'a'.repeat(20000) })
+  check('超大 CSS 返回 413', hugeCss.status === 413, `HTTP ${hugeCss.status}`)
+
+  section('竞品标配：隐藏元素 / 暗色模式')
+
+  const hidden = await clipPixel({ hideSelectors: ['.band[data-index="0"]'] })
+  check(
+    'hideSelectors 生效（后续元素上移补位）',
+    hidden.color && colorsClose(hidden.color, BAND1),
+    hidden.color ? formatColor(hidden.color, BAND1) : hidden.error
+  )
+
+  const badHide = await post('/api/screenshot', {
+    url: FIXTURE_URL,
+    singleShot: true,
+    hideSelectors: ['a { color: red }'],
+  })
+  check('hideSelectors 含 CSS 注入字符被拒', badHide.status === 400, `HTTP ${badHide.status}`)
+
+  const DARK_CSS = [
+    '.band[data-index="0"] { background: rgb(20,20,20) !important; }',
+    '@media (prefers-color-scheme: dark) { .band[data-index="0"] { background: rgb(240,240,240) !important; } }',
+  ].join('\n')
+
+  const light = await clipPixel({ css: DARK_CSS, darkMode: false })
+  check(
+    '暗色模式关闭时走亮色分支',
+    light.color && colorsClose(light.color, [20, 20, 20]),
+    light.color ? formatColor(light.color, [20, 20, 20]) : light.error
+  )
+
+  const dark = await clipPixel({ css: DARK_CSS, darkMode: true })
+  check(
+    '暗色模式开启时走暗色分支',
+    dark.color && colorsClose(dark.color, [240, 240, 240]),
+    dark.color ? formatColor(dark.color, [240, 240, 240]) : dark.error
+  )
+
+  section('竞品标配：去 Cookie 弹窗')
+
+  const MAKE_BANNER_JS =
+    "const d=document.createElement('div');d.className='cookie-banner';" +
+    "d.style.cssText='position:fixed;top:0;left:0;width:60px;height:60px;background:rgb(7,7,7);z-index:99999';" +
+    'document.body.appendChild(d)'
+
+  const withBanner = await clipPixel({ js: MAKE_BANNER_JS, blockCookieBanners: false })
+  check(
+    '不开启时弹窗可见（对照）',
+    withBanner.color && colorsClose(withBanner.color, [7, 7, 7]),
+    withBanner.color ? formatColor(withBanner.color, [7, 7, 7]) : withBanner.error
+  )
+
+  const withoutBanner = await clipPixel({ js: MAKE_BANNER_JS, blockCookieBanners: true })
+  check(
+    '开启后弹窗被隐藏，露出底层内容',
+    withoutBanner.color && colorsClose(withoutBanner.color, BAND0),
+    withoutBanner.color ? formatColor(withoutBanner.color, BAND0) : withoutBanner.error
+  )
+
+  section('竞品标配：PDF 输出')
+
+  const pdf = await post('/api/screenshot', { url: FIXTURE_URL, format: 'pdf' })
+  if (pdf.data?.success) {
+    const buf = Buffer.from(pdf.data.screenshot, 'base64')
+    check('返回 PDF（%PDF- 魔数）', buf.subarray(0, 5).toString('ascii') === '%PDF-', `${buf.length} 字节`)
+    check('contentType 为 application/pdf', pdf.data.contentType === 'application/pdf', pdf.data.contentType)
+  } else {
+    check('返回 PDF（%PDF- 魔数）', false, pdf.data?.error || `HTTP ${pdf.status}`)
+  }
+
+  section('等待策略')
+
+  const waited = await post('/api/screenshot', {
+    url: FIXTURE_URL,
+    singleShot: true,
+    waitForSelector: '.band[data-index="49"]',
+  })
+  check('waitForSelector 命中即截图', waited.data?.success === true, waited.data?.error || '')
+
+  const never = await post('/api/screenshot', {
+    url: FIXTURE_URL,
+    singleShot: true,
+    waitForSelector: '.band[data-index="9999"]',
+  })
+  check('waitForSelector 超时返回 504', never.status === 504, `HTTP ${never.status}`)
+}
+
+async function testBulk() {
+  section('竞品标配：批量截图')
+
+  const two = await post('/api/screenshot/bulk', {
+    urls: [FIXTURE_URL, `${BASE_URL}/test-fixture.html`],
+    singleShot: true,
+  })
+  if (two.data?.success) {
+    check('两张全部成功', two.data.succeeded === 2 && two.data.failed === 0, `成功 ${two.data.succeeded} 失败 ${two.data.failed}`)
+    check('结果条数与请求一致', (two.data.results || []).length === 2, `实际 ${(two.data.results || []).length} 条`)
+  } else {
+    check('两张全部成功', false, two.data?.error || `HTTP ${two.status}`)
+  }
+
+  const partial = await post('/api/screenshot/bulk', {
+    urls: [FIXTURE_URL, 'http://169.254.169.254/latest/meta-data/'],
+    singleShot: true,
+  })
+  if (partial.data?.success) {
+    check(
+      '单个失败不影响整批（仍返回 200）',
+      partial.status === 200 && partial.data.succeeded === 1 && partial.data.failed === 1,
+      `成功 ${partial.data.succeeded} 失败 ${partial.data.failed}`
+    )
+    check(
+      '失败项给出了拒绝原因',
+      String((partial.data.results || []).find(r => !r.success)?.error || '').includes('内网'),
+      (partial.data.results || []).find(r => !r.success)?.error || ''
+    )
+  } else {
+    check('单个失败不影响整批（仍返回 200）', false, partial.data?.error || `HTTP ${partial.status}`)
+  }
+
+  const tooMany = await post('/api/screenshot/bulk', { urls: new Array(21).fill(FIXTURE_URL) })
+  check('超过 20 个地址返回 400', tooMany.status === 400, `HTTP ${tooMany.status} ${tooMany.data?.error || ''}`)
+
+  const empty = await post('/api/screenshot/bulk', { urls: [] })
+  check('空数组返回 400', empty.status === 400, `HTTP ${empty.status}`)
+
+  const notArray = await post('/api/screenshot/bulk', { urls: FIXTURE_URL })
+  check('urls 非数组返回 400', notArray.status === 400, `HTTP ${notArray.status}`)
+}
+
 async function testRateLimit() {
   section('限流（放在最后，会消耗掉本机额度）')
 
@@ -533,8 +733,10 @@ async function main() {
       const segments = await testFixtureBatch()
       await testFixtureFullPage()
       await testMerge(segments)
+      await testPageOptions()
+      await testBulk()
     } else {
-      console.log('\n\x1b[33m基准页不可用，跳过所有分段 / 拼接用例\x1b[0m')
+      console.log('\n\x1b[33m基准页不可用，跳过所有分段 / 拼接 / 页面修饰用例\x1b[0m')
     }
 
     if (RUN_EXTERNAL) {
