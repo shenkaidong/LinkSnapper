@@ -1,17 +1,34 @@
-# 生产部署用的 compose 配置。
+# LinkSnapper 部署配置
+#
+# 开箱即用：默认直接拉 GHCR 上已构建好的镜像，不需要本地构建。
+#   docker compose up -d
+#
+# 想从源码构建（改了代码、或要验证 Dockerfile）：
+#   把下面 image: 一行注释掉、build: 一行取消注释，再 docker compose up -d --build
+#
 # 注意：这里刻意不挂载源码目录 —— 镜像里已经装好依赖并完成构建，
 # 挂载 .:/app 会用本地源码覆盖掉这些产物，导致容器起不来。
 services:
   web:
-    build: .
-    image: linksnapper:latest
+    image: ghcr.io/shenkaidong/linksnapper:latest
+    # build: .
     container_name: linksnapper
     ports:
       - "3000:3000"
     environment:
       - NODE_ENV=production
-      # 允许截图内网地址时改为 true（默认禁止，防 SSRF）
+      # 访问令牌。留空表示不鉴权 —— 只适合本机自用；暴露到公网务必设置。
+      # - SCREENSHOT_API_TOKEN=change-me
+      # 是否允许截图内网地址。默认 false（防 SSRF）。
+      # 需要截内网页面时，更安全的做法是精确放行单个主机：
+      # - ALLOWED_INTERNAL_HOSTS=10.0.0.5
       - ALLOW_PRIVATE_NETWORK=false
+      # 并发与限流。默认够个人自用，压测前按需调：
+      # - MAX_CONCURRENT_CAPTURES=3
+      # - RATE_LIMIT_CAPACITY=6
+      # - RATE_LIMIT_REFILL_PER_SEC=0.2
+      # 多实例部署时把限流状态外置到 Redis，否则每个实例各算各的额度：
+      # - REDIS_URL=redis://redis:6379
     # Chromium 对 /dev/shm 需求较大，默认 64MB 容易导致标签页崩溃
     shm_size: "1gb"
     restart: unless-stopped

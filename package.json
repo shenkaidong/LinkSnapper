@@ -13,6 +13,7 @@
     "install-chrome": "node scripts/install-chrome.mjs",
     "smoke": "node scripts/smoke-test.mjs",
     "smoke:mcp": "node scripts/mcp-smoke.mjs",
+    "demo": "bash scripts/demo.sh",
     "bench": "node scripts/bench.mjs",
     "test": "npm run typecheck && npm run test:unit",
     "mcp:pack": "cd mcp && npm pack --dry-run",

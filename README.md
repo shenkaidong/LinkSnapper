@@ -133,15 +133,32 @@ Request body:
   "maxSegments": 6,       // paged mode: how many segments to return per request (1–12), default 6
   "selector": null,       // CSS selector: capture only the first matching element (full element, may exceed viewport); highest priority
   "clip": null,           // manual crop {x,y,width,height} in page coordinates (CSS px); overrides fullPage/singleShot
-  "format": "png",        // output format: png / jpeg / webp, default png
-  "quality": 80           // jpeg / webp quality 1–100, default 80 (ignored for png)
+  // —— page decoration and waiting (all optional) ——
+  "device": null,          // mobile / tablet / desktop preset
+  "width": null,           // custom viewport width (overrides the device preset)
+  "height": null,          // custom viewport height
+  "deviceScaleFactor": 1,  // pixel density 1–3; 2/3 gives retina clarity at 2–4x the file size
+  "darkMode": false,       // render with prefers-color-scheme: dark
+  "blockAds": false,       // abort ad / analytics / tracking requests
+  "blockCookieBanners": false,
+  "hideSelectors": [],     // CSS selectors of elements to hide, max 20
+  "css": null,             // custom CSS injected before capture
+  "js": null,              // custom JS executed before capture
+  "waitForSelector": null, // wait for this selector before capturing; 504 on timeout
+  "waitForTimeout": 0,     // extra wait in ms after the page settles, max 30000
+  "format": "png",         // output format: png / jpeg / webp / pdf, default png
+  "quality": 80            // jpeg / webp quality 1–100, default 80 (ignored for png)
 }
 ```
 
-Parameter precedence: `selector` > `clip` > `fullPage` > `singleShot` > paged.
+Parameter precedence: `pdf` > `selector` > `clip` > `fullPage` > `singleShot` > paged.
 `selector` / `clip` return a single image (no paging/merge) and are still covered by the two-layer SSRF guard.
 `format` applies to viewport / full-page / element / region captures; paged mode always returns PNG to stay
 compatible with `/api/merge`. The response also includes `format` and `contentType` for correct decoding.
+
+`prefers-color-scheme` is emulated **explicitly for both `darkMode: true` and `false`**. Otherwise
+the unset case falls back to the host OS theme, so the same URL with the same parameters produces
+different images on a dark-mode macOS laptop and in a Linux container.
 
 Response:
 
@@ -169,6 +186,13 @@ Failures use meaningful status codes: `400` bad request, `401` missing token, `4
 URL guard, `413` body or page height over the limit, `429` rate limited, `503` queue overloaded,
 `502/504` target site problems.
 
+### `POST /api/screenshot/bulk`
+
+Up to **20** URLs in one call. Each result succeeds or fails independently — one bad URL out of
+twenty does not fail the batch, because that would just push retry logic back onto the caller.
+Concurrency is deliberately low (2 by default, since every capture holds a Chromium) and rate
+limits are charged per image, otherwise the batch endpoint would be a free bypass of the limiter.
+
 ### `POST /api/merge`
 
 Body `{ "screenshots": ["<base64>", "<base64>"] }`, returns `{ success, mergedImage }`.
@@ -183,10 +207,24 @@ container health check.
 ## Docker
 
 ```bash
-docker compose up -d --build
-# or
+# Use the prebuilt image (recommended — no local build needed)
+docker run -d --name linksnapper -p 3000:3000 --shm-size=1g \
+  ghcr.io/shenkaidong/linksnapper:latest
+
+# Or via compose (pulls the image; comment out `image:` and enable `build:` for source builds)
+docker compose up -d
+
+# Or build locally
 docker build -t linksnapper .
 docker run -d -p 3000:3000 --shm-size=1g linksnapper
+```
+
+Images are published for `linux/amd64` and `linux/arm64`.
+
+To see it working without installing Node or Chrome:
+
+```bash
+bash scripts/demo.sh
 ```
 
 The image is based on **Debian (glibc)** `node:20-bookworm-slim`. The build runs
@@ -253,6 +291,13 @@ about to make, with DNS results cached for 60 seconds:
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+The code is **MIT** — see [LICENSE](LICENSE). Free for any use, including commercial and
+closed-source embedding; self-hosting is explicitly encouraged and costs nothing.
+
+The name "LinkSnapper" and the logo are **not** covered by MIT. Managed hosting, SLA and support
+response times, enterprise features (multi-tenancy, SSO, audit export, compliance documentation)
+and trademark use fall under a commercial license — see
+[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md). That license is **additive** on top of MIT and
+never reduces any right MIT already gives you.
 
 [中文文档](README-CN.md)

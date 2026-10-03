@@ -11,7 +11,12 @@ LinkSnapper 是一个网页截图工具，针对动态加载站点、单页应�
   - 整页截图：一次性截取完整页面
   - 元素截图：用 CSS `selector` 只截某个元素（整元素，可超出视口）
   - 区域截图：用 `clip` 手动裁剪页面任意矩形区域
-- 🎨 **输出格式可选**：支持 `png` / `jpeg` / `webp`，jpeg / webp 可设 `quality`，统一先截 PNG 再转码保证稳定
+- 🎨 **输出格式可选**：支持 `png` / `jpeg` / `webp` / `pdf`，jpeg / webp 可设 `quality`，统一先截 PNG 再转码保证稳定
+- 📱 **设备模拟**：`device=mobile / tablet / desktop` 预设，同时设置分辨率、像素密度与 `isMobile / hasTouch`
+  （只改分辨率不改 `isMobile`，响应式断点根本不会触发，截出来仍是桌面布局）
+- ✏️ **页面修饰**：`darkMode`、`blockAds`、`blockCookieBanners`、`hideSelectors`、注入 `css` / `js`
+- ⏱️ **等待策略**：`waitForSelector` 等目标元素出现再截，比猜时间可靠；另有 `waitForTimeout` 兜底
+- 📦 **批量截图**：`POST /api/screenshot/bulk` 一次最多 20 个地址，单个失败不影响整批
 - ⚡ **浏览器实例复用**：Chromium 进程常驻并空闲回收，省掉每次请求 0.5～1.5 秒的冷启动
 - 🔗 **长图拼接**：把已截取的多段画面纵向合并为一张长图（服务端用 sharp 处理）
 - 🛡️ **两层 SSRF 防护**：既校验 URL 字面量，也在浏览器发出请求的那一刻逐个校验，能挡住重定向与子资源探测
@@ -43,11 +48,32 @@ LinkSnapper 是一个网页截图工具，针对动态加载站点、单页应�
 
 - Docker（可选，仅容器化部署需要）
 
-## 快速开始
+## 一键体验
+
+只想先看看效果，不用装 Node、不用装 Chrome：
+
+```bash
+bash scripts/demo.sh
+```
+
+它会自动拉容器起服务，截三张图（视口 / 手机设备模拟 / 按选择器截元素）存到
+`/tmp/linksnapper-demo`，最后打印出可以直接粘进 Claude / Cursor 的 MCP 配置。
+演示用的是服务自带的基准页，**全程不需要联网**。
+
+也可以用已构建好的镜像直接起：
+
+```bash
+docker run -d --name linksnapper -p 3000:3000 --shm-size=1g \
+  ghcr.io/shenkaidong/linksnapper:latest
+```
+
+打开 http://localhost:3000 即可用 Web 界面；`curl http://localhost:3000/api/health` 确认存活。
+
+## 快速开始（从源码）
 
 ```bash
 # 1. 克隆仓库
-git clone <你的仓库地址> LinkSnapper
+git clone https://github.com/shenkaidong/LinkSnapper.git
 cd LinkSnapper
 
 # 2. 安装依赖
@@ -133,15 +159,32 @@ npm run bench         # 分段截图性能对照（需服务已在跑）
   "maxSegments": 6,       // 分段模式下单次最多返回几段（1～12），默认 6
   "selector": null,       // CSS 选择器：只截匹配到的第一个元素（整元素，可超出视口）；优先级最高
   "clip": null,           // 手动裁剪区域 {x,y,width,height}（页面坐标系，CSS 像素）；优先级高于 fullPage/singleShot
-  "format": "png",        // 输出格式：png / jpeg / webp，默认 png
-  "quality": 80           // jpeg / webp 质量 1～100，默认 80（png 忽略）
+  // —— 页面修饰与等待（全部可选）——
+  "device": null,          // mobile / tablet / desktop 预设
+  "width": null,           // 自定义视口宽（给了 device 时覆盖预设）
+  "height": null,          // 自定义视口高
+  "deviceScaleFactor": 1,  // 像素密度 1～3，2/3 得到视网膜清晰度（体积成倍增长）
+  "darkMode": false,       // 以 prefers-color-scheme: dark 渲染
+  "blockAds": false,       // 拦截广告与统计追踪请求
+  "blockCookieBanners": false,
+  "hideSelectors": [],     // 要隐藏的元素选择器，最多 20 个
+  "css": null,             // 截图前注入的自定义 CSS
+  "js": null,              // 截图前执行的自定义 JS
+  "waitForSelector": null, // 等到该选择器出现再截图，超时返回 504
+  "waitForTimeout": 0,     // 页面就绪后额外等待毫秒数，上限 30000
+  "format": "png",         // 输出格式：png / jpeg / webp / pdf，默认 png
+  "quality": 80            // jpeg / webp 质量 1～100，默认 80（png 忽略）
 }
 ```
 
-参数优先级：`selector` > `clip` > `fullPage` > `singleShot` > 分段。
+参数优先级：`pdf` > `selector` > `clip` > `fullPage` > `singleShot` > 分段。
 `selector` 与 `clip` 命中后只返回单张图片（不走分段/拼接），且同样受 SSRF 两层防护约束。
 `format` 对整页 / 视口 / 元素 / 区域截图均生效；分段模式为兼容 `/api/merge` 拼接，恒返回 PNG。
 响应会额外返回 `format` 与 `contentType` 字段，方便调用方正确解码。
+
+关于 `darkMode`：**无论传 true 还是 false，`prefers-color-scheme` 都会被显式模拟**。
+不这么做的话，关闭时取的是宿主 OS 的主题 —— 同一个 URL 同一份参数，在深色模式的 macOS
+上和 Linux 容器里会产出两张不同的图。截图服务的输出只应由参数决定。
 
 响应：
 
@@ -168,6 +211,44 @@ npm run bench         # 分段截图性能对照（需服务已在跑）
 失败时返回相应的状态码：`400` 参数错误、`401` 缺少令牌、`403` 被安全护栏拦截、
 `413` 请求体或页面高度超限、`429` 触发限流、`503` 排队过载、`502/504` 目标站点问题。
 
+### `POST /api/screenshot/bulk`
+
+一次提交多个地址。单次最多 **20** 个。
+
+```jsonc
+{
+  "urls": ["https://example.com", "https://example.org"],
+  // 以下参数对所有 URL 生效，取值同 /api/screenshot
+  "singleShot": true,
+  "device": "mobile",
+  "format": "png"
+}
+```
+
+响应里每一项独立给出成败：
+
+```jsonc
+{
+  "success": true,
+  "total": 2,
+  "succeeded": 1,
+  "failed": 1,
+  "results": [
+    { "url": "https://example.com", "success": true, "segments": [/* ... */] },
+    { "url": "https://example.org", "success": false, "error": "导航超时" }
+  ]
+}
+```
+
+几个刻意的设计取舍：
+
+- **单个失败不影响整批** —— 20 个里挂 1 个就整个返回 500 的话，调用方还得自己重试，
+  这个接口就没意义了。所以 HTTP 状态码只在「请求本身不合法」时才非 200。
+- **并发刻意压低**（默认 2）—— 每个截图都要占一个 Chromium，20 个一起上会把内存打满，
+  反而全部超时。
+- **限流按张数计费** —— 否则批量接口就是一条白送的限流绕过通道。
+- 安全校验与单张完全相同，不存在「批量模式下校验更松」这回事。
+
 ### `POST /api/merge`
 
 请求体 `{ "screenshots": ["<base64>", "<base64>"] }`，返回 `{ success, mergedImage }`。
@@ -183,7 +264,9 @@ npm run bench         # 分段截图性能对照（需服务已在跑）
 server 声明自己有哪些工具，客户端（Claude Desktop / Claude Code / Cursor / Windsurf）启动时自动发现，
 模型自己决定何时调用，结果直接回到对话里。
 
-本项目内置了一个 MCP server，把截图能力暴露给 Agent。
+本项目内置了一个 MCP server（源码在 `mcp/`，发布为 npm 包 [`linksnapper-mcp`](https://www.npmjs.com/package/linksnapper-mcp)），
+把截图能力暴露给 Agent。它是**薄转发层**：所有实际工作（含安全校验）都由上面的 HTTP 接口完成，
+MCP 层不做任何 URL 判断 —— 避免出现第二套绕过防护的入口。
 
 ### 配置
 
@@ -222,6 +305,12 @@ claude mcp add linksnapper npx -y linksnapper-mcp \
 | `capture_segmented` | 超长页面分段截取，带 `offset` 续传 |
 | `get_service_health` | 查看 Chromium 就绪状态、版本、限流模式、队列深度 |
 
+截图类工具共用的可选参数与 HTTP 接口一致：`format`、`quality`、`device`、`width` / `height` /
+`deviceScaleFactor`、`darkMode`、`blockAds`、`blockCookieBanners`、`hideSelectors`、`css`、`js`、
+`waitForSelector`、`waitForTimeout`。
+
+`format=pdf` 会以 MCP 的 **resource 块**返回，不是图片块 —— PDF 塞进 image 块客户端会直接渲染失败。
+
 ### 为什么 Agent 场景必须自带 SSRF 防护
 
 Agent 场景下**截图 URL 往往来自模型输出或网页内容**。一段植入在页面里的文本就能诱导
@@ -236,11 +325,19 @@ Agent 去截 `169.254.169.254/latest/meta-data/`（云主机元数据）或 `10.
 ## Docker 部署
 
 ```bash
-docker compose up -d --build
-# 或
+# 直接用已构建好的镜像（推荐，无需本地构建）
+docker run -d --name linksnapper -p 3000:3000 --shm-size=1g \
+  ghcr.io/shenkaidong/linksnapper:latest
+
+# 或用 compose（默认拉镜像；把 image: 注释掉、build: 打开即从源码构建）
+docker compose up -d
+
+# 或纯本地构建
 docker build -t linksnapper .
 docker run -d -p 3000:3000 --shm-size=1g linksnapper
 ```
+
+镜像同时提供 `linux/amd64` 与 `linux/arm64` 两个架构。
 
 镜像基于 **Debian（glibc）** 的 `node:20-bookworm-slim`。构建时会通过
 `scripts/install-chrome.mjs` 下载**与 puppeteer-core 锁定的同一个 Chrome for Testing
@@ -314,6 +411,12 @@ docker run -d -p 3000:3000 --shm-size=1g linksnapper
 
 ## 许可证
 
-本项目采用 MIT 许可证，详见 [LICENSE](LICENSE)。
+代码采用 **MIT 许可证**，详见 [LICENSE](LICENSE) —— 免费、可商用、可自托管、
+可嵌入闭源产品，没有任何需要付费才能使用的代码。
+
+名称「LinkSnapper」与 Logo 不在 MIT 授权范围内；托管服务、SLA、支持响应、
+企业功能（多租户 / SSO / 审计导出 / 合规材料）与商标授权属于商业授权范畴，
+见 [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md)。商业授权是**叠加**在 MIT 之上的，
+不会削弱 MIT 已经给你的任何权利。
 
 [English Documentation](README.md)
