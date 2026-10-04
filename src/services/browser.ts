@@ -17,16 +17,6 @@ import getChromePath from '@/utils/chrome'
 
 const require = createRequire(import.meta.url)
 
-/** 读入已安装的 puppeteer-core 主版本，用于决定 headless 的取值 */
-function puppeteerMajor(): number {
-  try {
-    const pkg = require('puppeteer-core/package.json')
-    return Number.parseInt(String(pkg.version).split('.')[0], 10) || 21
-  } catch {
-    return 21
-  }
-}
-
 const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS) || 30_000
 const IDLE_SHUTDOWN_MS = Number(process.env.BROWSER_IDLE_SHUTDOWN_MS) || 60_000
 
@@ -74,13 +64,14 @@ function launchArgs(): string[] {
  * 「升级 puppeteer-core」不必同时改代码：升级到 22+ 时 'new' 会自动降级成 true，
  * 否则启动会直接报错。
  */
-function resolveHeadlessMode(): 'new' | boolean {
+function resolveHeadlessMode(): boolean {
   const raw = (process.env.HEADLESS_MODE || '').trim().toLowerCase()
   if (raw === 'true') return true
   if (raw === 'false') return false
-  // 默认：puppeteer 21 用 'new'（新无头模式，渲染更准）；
-  // 22+ 已移除该取值，回退到 true（同样是新无头模式）。
-  return puppeteerMajor() >= 22 ? true : 'new'
+  // 默认走新无头模式。puppeteer 22 移除 'new' 取值、23 起彻底不接受，
+  // 25 的类型已收敛成 boolean | 'shell' —— 这里统一给 true，
+  // 它在新版里就是新无头模式本身，渲染结果与当年的 'new' 一致。
+  return true
 }
 
 async function launchBrowser(): Promise<Browser> {

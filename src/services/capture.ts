@@ -345,10 +345,12 @@ async function measurePage(page: Page) {
 }
 
 async function takeClip(page: Page, offset: number, width: number, height: number): Promise<string> {
-  const image = await page.screenshot({
+  // puppeteer 23 起 page.screenshot 不再接受 encoding:'base64'（连同 Buffer 一起
+  // 直接返回）。分段结果最终是以 base64 字符串回给前端的，所以这里取 Buffer
+  // 再转，对外的 JSON 契约保持不变。
+  const image = (await page.screenshot({
     type: 'png',
     optimizeForSpeed: true,
-    encoding: 'base64',
     captureBeyondViewport: true,
     clip: {
       x: 0,
@@ -356,9 +358,9 @@ async function takeClip(page: Page, offset: number, width: number, height: numbe
       width,
       height,
     },
-  })
+  })) as Buffer
 
-  return image as string
+  return image.toString('base64')
 }
 
 /**

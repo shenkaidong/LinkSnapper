@@ -122,4 +122,10 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
 
 # 用 tini 作为 PID 1 启动，避免 Chromium 僵尸进程堆积
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["npm", "start"]
+
+# 直调 next 而不是 `npm start`：tini 把信号直接交给子进程，
+# 这条链上少一层 npm，SIGTERM 就能原样到达 next，lifecycle 的排空逻辑
+# 才真的跑得起。实测过 `npm start` 的写法：停服务时 tini 把信号给了 npm，
+# npm 自己先退出，真正的 next-server 收不到信号就成了孤儿进程留在后台，
+# 占位内存、下次起服务端口还被占着。
+CMD ["node", "node_modules/next/dist/bin/next", "start"]

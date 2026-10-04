@@ -176,9 +176,10 @@ async function main() {
       arguments: { url: `${BASE_URL}/test-fixture.html`, selector: '.does-not-exist' },
     })
     check(missing.isError === true, '选择器未命中时返回错误而非空图')
+    const missingText = ((missing.content?.[0]?.text) + '').slice(0, 300)
     check(
-      ((missing.content?.[0]?.text) + '').includes('未匹配到'),
-      '错误信息说明了未匹配到元素（模型可据此换选择器）'
+      missingText.includes('未匹配到'),
+      `错误信息说明了未匹配到元素（模型可据此换选择器） — 实际：${missingText}`
     )
   } finally {
     await client.close()
