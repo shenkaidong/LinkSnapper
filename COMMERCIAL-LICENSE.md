@@ -15,7 +15,7 @@
 - 个人、商业、内部使用，免费，无时间限制；
 - 自行部署任意数量的实例（含内网、离线环境）；
 - 修改、二次开发、嵌入到你自己的产品里（含闭源商业产品）；
-- 分发副本，包括收费分发（Apache-2.0 从不允许对"运行中的服务"收费限制，
+- 分发副本，包括收费分发（Apache-2.0 从不允许对「运行中的服务」收费，
   它只要求你在分发的副本里带上许可证与 NOTICE）。
 
 义务只有三条，都很轻：
@@ -51,9 +51,11 @@
 4. **商标授权** —— 允许在产品名、市场材料中使用 LinkSnapper 名称。
 5. **担保与赔偿** —— 开源许可不提供的那部分法律保护。
 
-按年订阅或按用量计费，具体以合同为准。
+商业授权按合同谈（部署规模、要不要 SLA 与担保赔偿、要不要商标授权），
+目前没有公开的价目表 —— 先聊需求，再给出对应的报价。
 
-> **当前实现状态（2026-10）**：上面第 1、2、4 项可以直接买；第 3 项里的
+> **当前实现状态（2026-10）**：上面第 1、2、4、5 项属于商业授权覆盖范围，
+> 但**没有自助购买入口也没有公开价目表** —— 走邮件沟通、按合同开通；第 3 项里的
 > 多租户 / 配额计费 / SSO / 审计导出**目前尚未实现**，属于企业版路线图。
 > 采购前请确认哪些功能已经落地，别为一个占位键付钱。
 
@@ -65,7 +67,7 @@
 
 ## 5. 谁应该考虑付费
 
-- 法务不接受"仅有开源许可、无担保无赔偿"的采购流程；
+- 法务不接受「仅有开源许可、无担保无赔偿」的采购流程；
 - 需要有人为线上故障负责，而不是自己盯着 Chromium 崩溃；
 - 需要多租户、配额计费、SSO 这类企业功能，且不想自己维护分支；
 - 想把 LinkSnapper 的名字用在自己的对外产品上。
@@ -74,10 +76,12 @@
 
 - 一般用途不需要联系，直接按 Apache-2.0 用即可。
 - 报问题：提 Issue 或开 Discussion，公开渠道通常比邮件更快。
-- 商业咨询：开 Discussion 并标注 `[commercial]`，或发邮件到下面这行
-  （**发布前请把 `<!-- TODO -->` 去掉并替换成真实邮箱**，否则这一节等于没有出口）：
+- 商业咨询：开 Discussion 并标注 `[commercial]` 通常更快；也可以直接发邮件到
+  **kaidong.shen@foxmail.com**，附上你的部署规模、是否需要 SLA / 企业功能，
+  我们会在一个工作日内回复。
 
-  `<!-- TODO: 填入商业咨询邮箱 -->`
+  > 目前还没有公开的定价页 —— 商业授权按合同谈（部署规模、要不要 SLA、要不要商标授权），
+  > 先说清楚需求再报价，比先贴一个价目表有用。
 
 ---
 
@@ -107,3 +111,8 @@ confirm what is actually delivered before buying.
 
 If you are an individual, a student, an open-source project, or a company happy to
 self-host without an SLA: just use it under Apache-2.0. No payment, no need to contact us.
+
+Commercial enquiries: open a Discussion tagged `[commercial]`, or email
+**kaidong.shen@foxmail.com** with your deployment scale and whether you need an SLA or
+the enterprise features. There is no published price list yet — we quote per contract
+after understanding the requirement.
