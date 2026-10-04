@@ -25,12 +25,22 @@ jobs:
   # 容器镜像 → ghcr.io/<owner>/linksnapper
   # ---------------------------------------------------------------------
   image:
-    runs-on: ubuntu-latest
+    # 锁定 ubuntu-24.04：ubuntu-latest 会在 2026-10-19 迁移到 Ubuntu 26，
+    # 发版流水线不该被运行镜像的滚动升级意外打断。
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
     steps:
       - uses: actions/checkout@v4
+
+      # GHCR 的镜像名必须是全小写。github.repository 保留原始大小写，
+      # 这里显式转一次 —— 第一次跑就栽在这上面：
+      # buildx 报 invalid tag "ghcr.io//linksnapper:main"，因为
+      # github.repository_owner_lowercase 这个上下文取出来是空的。
+      - name: 计算镜像名
+        id: image
+        run: echo "name=ghcr.io/$(printf '%s' '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       - uses: docker/setup-qemu-action@v3
         with:
@@ -49,7 +59,7 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner_lowercase }}/linksnapper
+          images: ${{ steps.image.outputs.name }}
           tags: |
             type=ref,event=branch
             type=semver,pattern={{version}}
@@ -76,7 +86,7 @@ jobs:
   # ---------------------------------------------------------------------
   npm:
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       # npm provenance：把包的构建来源写进 npm 的公开审计日志。
