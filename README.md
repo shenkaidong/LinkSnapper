@@ -15,6 +15,8 @@ LinkSnapper is a web screenshot tool that applies tailored loading strategies to
 - 🧩 **Stateless API**: the paging cursor is owned by the client and passed in each request, so the server holds no session state and can scale horizontally
 - 🚦 **Rate limiting and concurrency control**: per-IP token bucket, concurrency cap, bounded queue, optional API token
 - 🌙 Dark mode and responsive layout
+- 🔍 **Visual change monitoring**: freeze a baseline screenshot, then diff against it and get a
+  changed-pixel ratio, the bounding box of what moved, and an annotated image
 
 ## Tech stack
 
@@ -117,6 +119,10 @@ See [`.env.example`](.env.example). The ones you are most likely to touch:
 | `RATE_LIMIT_REFILL_PER_SEC` | `0.2` | Token refill rate (≈12 requests/minute) |
 | `MAX_CONCURRENT_CAPTURES` | `3` | Simultaneous capture jobs (each holds one Chromium) |
 | `BROWSER_IDLE_SHUTDOWN_MS` | `60000` | How long an idle browser instance is kept alive |
+| `SNAPSHOT_DIR` | `./.snapshots` | Where visual baselines are stored (mount a volume in Docker) |
+| `MAX_SNAPSHOTS` | `200` | Baselines kept before the oldest are evicted |
+| `SNAPSHOT_DIFF_MAX_SIDE` | `1600` | Comparison canvas size; full-page images are scaled to fit |
+| `SNAPSHOT_DIFF_THRESHOLD` | `16` | Per-channel colour delta that counts as “changed” |
 
 ## API
 
@@ -198,6 +204,48 @@ limits are charged per image, otherwise the batch endpoint would be a free bypas
 Body `{ "screenshots": ["<base64>", "<base64>"] }`, returns `{ success, mergedImage }`.
 Images with differing widths are resized to match the first one before compositing.
 At most 60 segments and 30000px of total height.
+
+### `POST /api/snapshot` — freeze a visual baseline
+
+Visual-change monitoring, step one. Screenshot the page **as it should look** and store it as a
+baseline. Response echoes back the `key`, `bytes` and the image itself.
+
+```jsonc
+// request
+{ "url": "example.com", "key": "home-v2", "singleShot": true, "width": 1280 }
+// response
+{ "success": true, "action": "baseline", "key": "home-v2", "savedAt": "...", "bytes": 48211,
+  "image": "<base64 PNG>" }
+```
+
+`key` is optional: the server derives one from `sha1(url + params)` so the same URL with the same
+viewport always maps to the same baseline, while a different viewport or `darkMode` automatically
+becomes a separate baseline. Keys allow `A-Za-z0-9_-` only, length 1–64 — the key is part of a
+file path, so anything else is rejected before it can touch the filesystem.
+
+### `POST /api/snapshot/compare` — did it change?
+
+```jsonc
+// request
+{ "url": "example.com", "key": "home-v2", "threshold": 16 }
+// response
+{ "success": true, "changed": true, "changedPixels": 184320, "changedRatio": 0.45,
+  "boundingBox": { "x": 0, "y": 120, "width": 1280, "height": 320 },
+  "width": 1280, "height": 720, "threshold": 16, "scaled": false,
+  "diffImage": "<base64 PNG, differences in red>" }
+```
+
+`diffImage` marks every changed pixel red and keeps the baseline underneath untouched, so you
+can look at one image and see what moved. The bounding box is reported in **original pixel
+coordinates**, not thumbnail coordinates — the comparison is done on images scaled down to
+`maxSide` (1600 by default) because a 1920×30000 full-page scan would block the event loop.
+
+A missing baseline is a `404`, deliberately: silently creating one would turn “never alerted”
+into “never compared”, which is the failure mode nobody notices.
+
+Baselines live on disk under `SNAPSHOT_DIR` (default `./.snapshots`) with an LRU cap
+(`MAX_SNAPSHOTS`, default 200) and a `MAX_SNAPSHOTS`-driven cleaner, so a long-running
+monitoring job cannot fill the disk.
 
 ### `GET /api/health`
 
@@ -291,13 +339,19 @@ about to make, with DNS results cached for 60 seconds:
 
 ## License
 
-The code is **MIT** — see [LICENSE](LICENSE). Free for any use, including commercial and
-closed-source embedding; self-hosting is explicitly encouraged and costs nothing.
+The code is **Apache-2.0** — see [LICENSE](LICENSE) and [NOTICE](NOTICE). Free for any use,
+including commercial and closed-source embedding; self-hosting is explicitly encouraged and
+costs nothing.
 
-The name "LinkSnapper" and the logo are **not** covered by MIT. Managed hosting, SLA and support
-response times, enterprise features (multi-tenancy, SSO, audit export, compliance documentation)
-and trademark use fall under a commercial license — see
-[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md). That license is **additive** on top of MIT and
-never reduces any right MIT already gives you.
+Compared with MIT, Apache-2.0 adds two things enterprises care about: an express **patent
+grant** from every contributor (which terminates automatically if you assert patent claims
+against this project), and a **NOTICE attribution duty** when you redistribute. Self-hosting
+and closed-source embedding work exactly as they do under MIT.
+
+The name "LinkSnapper" and the logo are **not** covered by Apache-2.0. Managed hosting, SLA and
+support response times, enterprise features (multi-tenancy, quota billing, SSO, audit export,
+compliance documentation) and trademark use fall under a commercial license — see
+[COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md). That license is **additive** on top of
+Apache-2.0 and never reduces any right the open-source license already gives you.
 
 [中文文档](README-CN.md)

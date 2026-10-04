@@ -45,3 +45,6 @@ next-env.d.ts
 
 # WorkBuddy 会话数据（项目相关，非缓存，但不应进版本库）
 .workbuddy/
+
+# 视觉变更监控的基准图（运行时产物；容器部署时靠 SNAPSHOT_DIR + 卷持久化）
+/.snapshots/

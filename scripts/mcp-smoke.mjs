@@ -67,7 +67,16 @@ async function main() {
     const names = tools.map(t => t.name)
     check(tools.length > 0, `列出 ${tools.length} 个工具：${names.join(', ')}`)
 
-    for (const name of ['take_screenshot', 'capture_element', 'capture_region', 'capture_full_page', 'capture_segmented', 'get_service_health']) {
+    for (const name of [
+      'take_screenshot',
+      'capture_element',
+      'capture_region',
+      'capture_full_page',
+      'capture_segmented',
+      'save_snapshot_baseline',
+      'compare_snapshot',
+      'get_service_health',
+    ]) {
       check(names.includes(name), `工具 ${name} 已注册`)
     }
 
@@ -149,6 +158,50 @@ async function main() {
     } else {
       fail('未返回图片块')
     }
+
+    // ---------------------------------------------------------------- 视觉变更监控
+    section('save_snapshot_baseline / compare_snapshot')
+    const baselineKey = `mcp-smoke-${Date.now().toString(36)}`
+    // 基准与比对必须用同一组参数，差异才是页面带来的而不是参数带来的
+    const shotArgs = { url: `${BASE_URL}/test-fixture.html`, singleShot: true, width: 320, height: 200 }
+
+    const saved = await client.callTool({
+      name: 'save_snapshot_baseline',
+      arguments: { ...shotArgs, key: baselineKey },
+    })
+    check(!saved.isError, `保存基准成功${saved.isError ? '：' + saved.content?.[0]?.text : ''}`)
+    check(
+      ((saved.content?.[0]?.text) || '').includes(baselineKey),
+      '返回里带上了 key（模型据此记住这份基准）'
+    )
+
+    const compare = await client.callTool({
+      name: 'compare_snapshot',
+      arguments: { ...shotArgs, key: baselineKey },
+    })
+    check(!compare.isError, '与基准比对成功（无变化）')
+    const compareText = ((compare.content?.[0]?.text) || '')
+    check(compareText.includes('没有视觉变化'), `给出"没变化"的结论 — ${compareText}`)
+    const compareImage = (compare.content || []).find(c => c.type === 'image')
+    check(
+      Boolean(compareImage) &&
+        Buffer.from(compareImage.data, 'base64').subarray(0, 8).equals(PNG_MAGIC),
+      'diff 图以图片块返回且是有效 PNG'
+    )
+
+    const changed = await client.callTool({
+      name: 'compare_snapshot',
+      arguments: { ...shotArgs, key: baselineKey, css: '*{background-color:#00ff00 !important}' },
+    })
+    check(!changed.isError, '注入 CSS 后比对成功')
+    const changedText = ((changed.content?.[0]?.text) || '')
+    check(/(?:发生)?变化/.test(changedText) && changedText.includes('变化像素'), `检出变化并给出比例与外接框 — ${changedText}`)
+
+    const noBaseline = await client.callTool({
+      name: 'compare_snapshot',
+      arguments: { ...shotArgs, key: 'mcp-smoke-no-baseline' },
+    })
+    check(noBaseline.isError === true, '基准不存在时返回错误，而不是笼统的"没变化"')
 
     // ---------------------------------------------------------------- 安全：SSRF
     section('安全：SSRF 防护必须透过 MCP 层生效')

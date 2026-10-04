@@ -41,6 +41,7 @@ import {
   SAFE_INTERNAL_PROTOCOLS,
 } from '@/utils/url-guard'
 import { HttpError } from '@/utils/http-error'
+import { BoundedSemaphore } from '@/utils/rate-limit'
 
 export const MAX_RETRIES = Number(process.env.MAX_RETRIES) || 2
 const RETRY_DELAY_MS = 1200
@@ -55,6 +56,23 @@ export const MAX_FULLPAGE_HEIGHT = Number(process.env.MAX_FULLPAGE_HEIGHT) || 30
 /** 单次请求最多返回几段（一次返回太多段会让响应体膨胀、前端渲染卡顿） */
 export const DEFAULT_MAX_SEGMENTS = 6
 export const MAX_SEGMENTS_PER_REQUEST = 12
+
+/**
+ * 并发闸门放在服务层而不是路由层，是为了让所有会拉起 Chromium 的接口
+ * （截图、批量、视觉变更监控）共用同一把锁。
+ * 早期每个 route 文件各 new 一个 BoundedSemaphore —— Next.js 会把每个 route
+ * 模块单独求值，结果就是「3 个并发」实际变成「N 个接口 × 3」，
+ * 实例数一多内存就顶不住。共享一个实例才是真正的上限。
+ */
+export const CAPTURE_CONCURRENCY = Number(process.env.MAX_CONCURRENT_CAPTURES) || 3
+export const CAPTURE_QUEUE_LENGTH = Number(process.env.MAX_QUEUE_LENGTH) || 24
+export const CAPTURE_QUEUE_TIMEOUT_MS = Number(process.env.QUEUE_TIMEOUT_MS) || 45_000
+
+export const captureSemaphore = new BoundedSemaphore(
+  CAPTURE_CONCURRENCY,
+  CAPTURE_QUEUE_LENGTH,
+  CAPTURE_QUEUE_TIMEOUT_MS
+)
 
 export type WebsiteType = 'dynamic' | 'static' | 'spa'
 

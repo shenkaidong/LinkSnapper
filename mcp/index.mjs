@@ -185,6 +185,44 @@ const TOOLS = [
     },
   },
   {
+    name: 'save_snapshot_baseline',
+    description:
+      '把当前页面冻结成一份视觉基准（key 省略时由服务端按 URL + 参数自动生成）。之后 compare_snapshot 就是跟这张图比。设定"页面应该是长什么样"时先调这个。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...COMMON_SCREENSHOT_PROPS,
+        key: {
+          type: 'string',
+          description:
+            '基准图标识，只允许字母数字 _ -，长度 1-64。省略则由服务端按 URL + 截图参数生成，同一组参数永远命中同一份基准。',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  {
+    name: 'compare_snapshot',
+    description:
+      '与已保存的基准图做像素比对，回答"这个页面变了没"。返回变化比例、差异区域外接框，以及一张把差异标红的图。做视觉回归检查、确认改版是否生效时用。基准不存在会明确报错 —— 那表示还没存过基准，不是"没变化"。',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        ...COMMON_SCREENSHOT_PROPS,
+        key: {
+          type: 'string',
+          description: '基准图标识；省略则按 URL + 参数自动推导，必须与保存基准时一致。',
+        },
+        threshold: {
+          type: 'number',
+          description:
+            '单通道色差超过多少算"变"，默认 16。调低（如 4）能抓细微样式改动，调高（如 40）能忽略抗锯齿抖动。',
+        },
+      },
+      required: ['url'],
+    },
+  },
+  {
     name: 'get_service_health',
     description: '查看截图服务的运行状态：Chromium 是否就绪、版本、限流模式、当前队列深度。排查"截图失败"时先调这个。',
     inputSchema: { type: 'object', properties: {} },
@@ -271,6 +309,9 @@ const FORWARDABLE_KEYS = [
   'offset',
   'maxSegments',
   'singleShot',
+  // 视觉变更监控专属：没有它们请求就丢了 key / 阈值
+  'key',
+  'threshold',
 ]
 
 function buildCaptureBody(args, extra = {}) {
@@ -362,6 +403,47 @@ async function handleTool(name, args = {}) {
 
     case 'capture_segmented':
       return segmentsToContent(await capture(buildCaptureBody(args)))
+
+    case 'save_snapshot_baseline': {
+      const { status, payload } = await callApi('/api/snapshot', {
+        method: 'POST',
+        body: JSON.stringify(buildCaptureBody(args)),
+      })
+      if (!payload?.success) throw new Error(payload?.error || `HTTP ${status}`)
+
+      return [
+        {
+          type: 'text',
+          text: `已保存视觉基准：key=${payload.key}（${payload.url}，${Math.round((payload.bytes || 0) / 1024)} KB，${payload.savedAt}）。后续用 compare_snapshot 比对。`,
+        },
+      ]
+    }
+
+    case 'compare_snapshot': {
+      const { status, payload } = await callApi('/api/snapshot/compare', {
+        method: 'POST',
+        body: JSON.stringify(buildCaptureBody(args)),
+      })
+      if (!payload?.success) {
+        // 404 = 从没存过基准。这个区别必须说清楚，否则模型会把"没基准"读成"没变化"。
+        throw new Error(
+          payload?.error || `HTTP ${status}`
+        )
+      }
+
+      const box = payload.boundingBox
+      const summary = [
+        payload.changed ? '页面与基准图相比发生了变化' : '页面与基准图一致，没有视觉变化',
+        `变化像素 ${payload.changedPixels}（${(payload.changedRatio * 100).toFixed(2)}%）`,
+        box ? `差异区域 x=${box.x} y=${box.y} ${box.width}×${box.height}` : '无差异区域',
+        `判定时阈值为 ${payload.threshold}`,
+      ].join(' · ')
+
+      return [
+        { type: 'text', text: summary },
+        { type: 'image', data: payload.diffImage, mimeType: 'image/png' },
+      ]
+    }
 
     case 'get_service_health': {
       const { payload } = await callApi('/api/health')

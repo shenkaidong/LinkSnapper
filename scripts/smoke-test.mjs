@@ -675,6 +675,64 @@ async function testBulk() {
   check('urls 非数组返回 400', notArray.status === 400, `HTTP ${notArray.status}`)
 }
 
+/** 只看开头几个字节就够判断是不是 png，不必为校验把整张图解出来 */
+function isPng(base64) {
+  if (!base64) return false
+  return Buffer.from(base64.slice(0, 12), 'base64').subarray(0, 8).equals(PNG_MAGIC)
+}
+
+/**
+ * 视觉变更监控（截图 diff）。
+ *
+ * 断言只挑「结论会骗人」的地方：
+ *   同一张图比对两次必须判「没变」—— 否则这条链路就是在给你发假警报；
+ *   改了背景色必须判「变了」并给出外接框 —— 否则等于什么都没发生；
+ *   基准缺失必须 404 —— 自动建基准会让「从没报警」变成「根本没比对过」。
+ */
+async function testSnapshotVisualDiff() {
+  section('视觉变更监控（截图 diff）')
+
+  const key = `smoke-${Date.now().toString(36)}`
+  // 固定视口：基准与比对必须用同一组参数，否则差异是参数带来的而不是页面带来的
+  const shot = { url: FIXTURE_URL, singleShot: true, width: 640, height: 320 }
+
+  const saved = await post('/api/snapshot', { ...shot, key })
+  check('保存基准图', saved.status === 200 && saved.data?.success === true, `HTTP ${saved.status} ${saved.data?.error || ''}`)
+  check('基准图是 png', isPng(saved.data?.image))
+  check('返回了 key', saved.data?.key === key, `key=${saved.data?.key}`)
+
+  const same = await post('/api/snapshot/compare', { ...shot, key })
+  check('同一页面与基准比对：判定为无变化', same.status === 200 && same.data?.changed === false, `HTTP ${same.status} ${same.data?.error || ''}`)
+  check('无变化时不给外接框', same.data?.boundingBox === null, `boundingBox=${JSON.stringify(same.data?.boundingBox)}`)
+  check('无变化时变化比例为 0', same.data?.changedRatio === 0, `changedRatio=${same.data?.changedRatio}`)
+  check('diff 图是 png', isPng(same.data?.diffImage))
+
+  const changed = await post('/api/snapshot/compare', {
+    ...shot,
+    key,
+    css: '*{background-color:#00ff00 !important;background-image:none !important}',
+  })
+  check('改了背景色能检出变化', changed.status === 200 && changed.data?.changed === true, `HTTP ${changed.status} ${changed.data?.error || ''}`)
+  check(
+    '变化比例在 0–1 之间且给出了外接框',
+    typeof changed.data?.changedRatio === 'number' &&
+      changed.data.changedRatio > 0 &&
+      changed.data.changedRatio <= 1 &&
+      Boolean(changed.data.boundingBox),
+    `changedRatio=${changed.data?.changedRatio} boundingBox=${JSON.stringify(changed.data?.boundingBox)}`
+  )
+  check('变化比例达到全图量级（整页被刷成绿色）', changed.data?.changedRatio > 0.5, `changedRatio=${changed.data?.changedRatio}`)
+
+  const missing = await post('/api/snapshot/compare', { ...shot, key: 'no-such-baseline-xyz' })
+  check('基准缺失返回 404（而不是静默建基准）', missing.status === 404, `HTTP ${missing.status}`)
+
+  const traversal = await post('/api/snapshot/compare', { ...shot, key: '../../../../etc/passwd' })
+  check('路径穿越的 key 被 400 拒绝', traversal.status === 400, `HTTP ${traversal.status}`)
+
+  const noUrl = await post('/api/snapshot', { key: 'whatever' })
+  check('缺 url 返回 400', noUrl.status === 400, `HTTP ${noUrl.status}`)
+}
+
 async function testRateLimit() {
   section('限流（放在最后，会消耗掉本机额度）')
 
@@ -735,6 +793,7 @@ async function main() {
       await testMerge(segments)
       await testPageOptions()
       await testBulk()
+      await testSnapshotVisualDiff()
     } else {
       console.log('\n\x1b[33m基准页不可用，跳过所有分段 / 拼接 / 页面修饰用例\x1b[0m')
     }

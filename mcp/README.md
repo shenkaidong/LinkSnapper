@@ -21,7 +21,7 @@ LinkSnapper 对此做了两层防护，市面上基本没有第二家做全：
 被拒绝时，server 会把**拒绝原因原样带回给模型**（`出于安全考虑，禁止截图内网或本机地址`），
 而不是一句含糊的"失败了"——否则模型会反复重试同一个地址。
 
-另外它是 **MIT 许可、可完全自托管**的。同类自托管方案里 star 最多的 browserless 用的是 SSPL，
+另外它是 **Apache-2.0 许可、可完全自托管**的。同类自托管方案里 star 最多的 browserless 用的是 SSPL，
 商业使用需要授权。
 
 ## 前置条件：先跑一个 LinkSnapper
@@ -115,7 +115,19 @@ curl http://127.0.0.1:3000/api/health
 | `出于安全考虑，禁止截图内网或本机地址` | 防护生效了。若确实需要，服务端用 `ALLOWED_INTERNAL_HOSTS` 精确放行单个主机，**不要用** `ALLOW_PRIVATE_NETWORK=true` |
 | 截图一片空白 | 页面是 SPA；加 `waitForSelector` 等具体内容出现 |
 
+## 视觉变更监控
+
+`save_snapshot_baseline` 存一份基准图，`compare_snapshot` 跟它比：
+
+```json
+{ "name": "compare_snapshot", "arguments": { "url": "example.com", "key": "home-v2" } }
+```
+
+返回一句结论（`变化像素 …（45.00%）` + `差异区域 x=… y=… w×h`）外加一张差异标红的图。
+基准不存在时明确报错，不会悄悄建一个新的 —— 否则「从没报警」只是「根本没比对过」。
+
 ## 许可
 
-MIT。见仓库根目录 [LICENSE](https://github.com/shenkaidong/LinkSnapper/blob/main/LICENSE)。
+Apache-2.0（[LICENSE](https://github.com/shenkaidong/LinkSnapper/blob/main/LICENSE) +
+[NOTICE](https://github.com/shenkaidong/LinkSnapper/blob/main/NOTICE)）。
 商业支持、SLA 与托管版本见 [COMMERCIAL-LICENSE.md](https://github.com/shenkaidong/LinkSnapper/blob/main/COMMERCIAL-LICENSE.md)。

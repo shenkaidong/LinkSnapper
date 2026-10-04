@@ -2,6 +2,7 @@
   "name": "linksnapper",
   "version": "1.0.0",
   "private": true,
+  "license": "Apache-2.0",
   "description": "一个现代化的网页截图工具",
   "scripts": {
     "dev": "next dev",
@@ -9,7 +10,7 @@
     "start": "next start",
     "lint": "next lint",
     "typecheck": "tsc --noEmit",
-    "test:unit": "node --experimental-transform-types --test tests/*.test.ts",
+    "test:unit": "node --experimental-transform-types --import ./scripts/ts-alias-register.mjs --test tests/*.test.ts",
     "install-chrome": "node scripts/install-chrome.mjs",
     "smoke": "node scripts/smoke-test.mjs",
     "smoke:mcp": "node scripts/mcp-smoke.mjs",

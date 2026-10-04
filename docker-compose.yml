@@ -29,6 +29,14 @@ services:
       # - RATE_LIMIT_REFILL_PER_SEC=0.2
       # 多实例部署时把限流状态外置到 Redis，否则每个实例各算各的额度：
       # - REDIS_URL=redis://redis:6379
+      # 视觉变更监控的基准图默认写在 /app/.snapshots（可用 SNAPSHOT_DIR 改）。
+      # 不挂卷的话每次容器重建，冻过的基准图就全丢了，巡检链路等于从头开始。
+      # - SNAPSHOT_DIR=/var/lib/linksnapper/snapshots
+    volumes:
+      - snapshots:/app/.snapshots
     # Chromium 对 /dev/shm 需求较大，默认 64MB 容易导致标签页崩溃
     shm_size: "1gb"
     restart: unless-stopped
+
+volumes:
+  snapshots:

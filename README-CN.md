@@ -12,6 +12,8 @@ LinkSnapper 是一个网页截图工具，针对动态加载站点、单页应�
   - 元素截图：用 CSS `selector` 只截某个元素（整元素，可超出视口）
   - 区域截图：用 `clip` 手动裁剪页面任意矩形区域
 - 🎨 **输出格式可选**：支持 `png` / `jpeg` / `webp` / `pdf`，jpeg / webp 可设 `quality`，统一先截 PNG 再转码保证稳定
+- 🔍 **视觉变更监控**：把当前页面冻成基准图（`/api/snapshot`），事后与它做像素比对
+  （`/api/snapshot/compare`），给出变化比例、差异区域外接框和一张标红的对比图
 - 📱 **设备模拟**：`device=mobile / tablet / desktop` 预设，同时设置分辨率、像素密度与 `isMobile / hasTouch`
   （只改分辨率不改 `isMobile`，响应式断点根本不会触发，截出来仍是桌面布局）
 - ✏️ **页面修饰**：`darkMode`、`blockAds`、`blockCookieBanners`、`hideSelectors`、注入 `css` / `js`
@@ -143,6 +145,10 @@ npm run bench         # 分段截图性能对照（需服务已在跑）
 | `RATE_LIMIT_REFILL_PER_SEC` | `0.2` | 每秒补充的令牌数（约 12 次/分钟） |
 | `MAX_CONCURRENT_CAPTURES` | `3` | 同时进行的截图任务数（每个都会占一个 Chromium） |
 | `BROWSER_IDLE_SHUTDOWN_MS` | `60000` | 浏览器实例空闲多久后回收 |
+| `SNAPSHOT_DIR` | `./.snapshots` | 视觉基准图存放目录（Docker 建议挂卷，见下） |
+| `MAX_SNAPSHOTS` | `200` | 最多保留多少份基准图，超出淘汰最旧的 |
+| `SNAPSHOT_DIFF_MAX_SIDE` | `1600` | 比对时画布尺寸，长图按比例缩到这个边长以内 |
+| `SNAPSHOT_DIFF_THRESHOLD` | `16` | 单通道色差超过多少算「变了」 |
 
 ## API
 
@@ -254,6 +260,44 @@ npm run bench         # 分段截图性能对照（需服务已在跑）
 请求体 `{ "screenshots": ["<base64>", "<base64>"] }`，返回 `{ success, mergedImage }`。
 不同宽度的图片会以第一张为基准等比缩放对齐后再拼接，段数上限 60，拼后高度上限 30000px。
 
+### `POST /api/snapshot` —— 冻结一张视觉基准
+
+视觉变更监控第一步：把「页面现在应该是长什么样」存下来，之后每次巡检都跟它比。
+
+```jsonc
+// 请求
+{ "url": "example.com", "key": "home-v2", "singleShot": true, "width": 1280 }
+// 响应
+{ "success": true, "action": "baseline", "key": "home-v2", "savedAt": "...", "bytes": 48211,
+  "image": "<base64 PNG>" }
+```
+
+`key` 可以不传：服务端按 `sha1(url + 参数)` 生成，同一地址 + 同一组参数永远命中同一份基准，
+换个视口或 `darkMode` 自动就是新基准。key 只 allow `A-Za-z0-9_-`，长度 1–64 ——
+它是文件路径的一部分，其它字符在碰到文件系统之前就被拒掉。
+
+### `POST /api/snapshot/compare` —— 这个页面变了没
+
+```jsonc
+// 请求
+{ "url": "example.com", "key": "home-v2", "threshold": 16 }
+// 响应
+{ "success": true, "changed": true, "changedPixels": 184320, "changedRatio": 0.45,
+  "boundingBox": { "x": 0, "y": 120, "width": 1280, "height": 320 },
+  "width": 1280, "height": 720, "threshold": 16, "scaled": false,
+  "diffImage": "<base64 PNG，差异处标红>" }
+```
+
+`diffImage` 把变了的像素标成红色、其余保持基准原样，看一张图就知道哪里动了。
+`boundingBox` 报的是**原图坐标**而不是缩略图坐标 —— 比对时图会缩到 `maxSide`（默认 1600）以内
+（1920×30000 的整页逐像素扫描是几千万次迭代，会卡死事件循环），结论再按缩放比换算回去。
+
+基准图缺失时返回 **404 而不是自动建基准**：自动建基准会把「从没报警过」变成「根本没比对过」，
+这种静默失败比报错危险得多。
+
+基准图落在 `SNAPSHOT_DIR`（默认 `./.snapshots`）里，带 LRU 上限（`MAX_SNAPSHOTS`，默认 200）。
+不设上限的话，跑几个月的巡检就能把磁盘写满，那时候连截图都存不下来。
+
 ### `GET /api/health`
 
 返回进程与浏览器状态、当前生效的安全开关，可直接用作容器健康检查。
@@ -303,7 +347,13 @@ claude mcp add linksnapper npx -y linksnapper-mcp \
 | `capture_region` | 按页面坐标截取矩形区域 |
 | `capture_full_page` | 整页截图 |
 | `capture_segmented` | 超长页面分段截取，带 `offset` 续传 |
+| `save_snapshot_baseline` | 把当前页面冻成视觉基准（新增 `key` 参数） |
+| `compare_snapshot` | 与基准做像素比对，返回变化比例、差异外接框与标红图（新增 `key` / `threshold` 参数） |
 | `get_service_health` | 查看 Chromium 就绪状态、版本、限流模式、队列深度 |
+
+`compare_snapshot` 的结论是给模型看的一句话，例如
+「页面与基准图相比发生了变化 · 变化像素 184320（45.00%）· 差异区域 x=0 y=120 1280×320 · 判定阈值 16」，
+后面再跟一张标红的 diff 图 —— 模型能直接读懂，不需要人去解释 JSON。
 
 截图类工具共用的可选参数与 HTTP 接口一致：`format`、`quality`、`device`、`width` / `height` /
 `deviceScaleFactor`、`darkMode`、`blockAds`、`blockCookieBanners`、`hideSelectors`、`css`、`js`、
@@ -411,12 +461,17 @@ docker run -d -p 3000:3000 --shm-size=1g linksnapper
 
 ## 许可证
 
-代码采用 **MIT 许可证**，详见 [LICENSE](LICENSE) —— 免费、可商用、可自托管、
-可嵌入闭源产品，没有任何需要付费才能使用的代码。
+代码采用 **Apache-2.0** 许可证（[LICENSE](LICENSE) + [NOTICE](NOTICE)）——
+免费、可商用、可自托管、可嵌入闭源产品，没有任何需要付费才能使用的代码。
 
-名称「LinkSnapper」与 Logo 不在 MIT 授权范围内；托管服务、SLA、支持响应、
+相比 MIT，Apache-2.0 多给企业两样东西：一条明确的**专利授权**（贡献者把相关专利
+授权给你，反过来你若就本项目发起专利诉讼则授权自动终止），以及 **NOTICE 合规义务**
+（分发衍生版时必须附带本 NOTICE）。这两条让多数企业采购流程一次过审，
+而「可以自托管、可以闭源嵌入」的实际权利与 MIT 完全一样。
+
+名称「LinkSnapper」与 Logo 不在 Apache-2.0 授权范围内；托管服务、SLA、支持响应、
 企业功能（多租户 / SSO / 审计导出 / 合规材料）与商标授权属于商业授权范畴，
-见 [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md)。商业授权是**叠加**在 MIT 之上的，
-不会削弱 MIT 已经给你的任何权利。
+见 [COMMERCIAL-LICENSE.md](COMMERCIAL-LICENSE.md)。商业授权是**叠加**在 Apache-2.0 之上的，
+不会削弱 Apache-2.0 已经给你的任何权利。
 
 [English Documentation](README.md)

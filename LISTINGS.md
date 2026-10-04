@@ -43,7 +43,7 @@ plus per-request interception inside the browser, which is what actually stops
 302 redirects, sub-resource probing and DNS rebinding. When a URL is refused, the
 reason is passed back to the model verbatim so it stops retrying the same address.
 
-MIT licensed and fully self-hostable. The most-starred comparable self-hosted
+Apache-2.0 licensed and fully self-hostable. The most-starred comparable self-hosted
 option (browserless) is SSPL, which requires a paid license for commercial use.
 
 Features: viewport / full-page / element / region / segmented capture, PDF output,
@@ -58,7 +58,7 @@ waitForSelector, and batch capture (20 URLs per call).
 一段植入文本就能诱导 Agent 去截 169.254.169.254（云主机元数据）或内网管理后台。
 LinkSnapper 用两层防护挡住这类 SSRF：URL 字面量校验（IPv6 按数值展开判断）
 + 浏览器逐个请求拦截（真正能挡住 302 重定向、子资源探测与 DNS 重绑定），
-且拒绝原因会原样回传给模型。MIT 许可，可完全自托管。
+且拒绝原因会原样回传给模型。Apache-2.0 许可，可完全自托管。
 ```
 
 **分类**：Developer Tools / Browser Automation / Screenshots / AI Agents
